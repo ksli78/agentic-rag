@@ -1,0 +1,7 @@
+streamlit==1.36.0
+agno==1.7.12
+lancedb==0.25.0
+pyarrow==16.1.0
+pypdf==4.2.0
+requests>=2.31.0
+ollama>=0.1.7
