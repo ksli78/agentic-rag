@@ -16,7 +16,7 @@ from pypdf import PdfReader
 import pdfplumber
 
 import re
-from collections import Counter
+from collections import Counter,defaultdict
 
 import lancedb
 from lancedb import LanceDBConnection
@@ -97,6 +97,48 @@ _HDR_PATTERNS = [
     r"^copyright.*$",
 ]
 _HDR_RES = [re.compile(p, re.I) for p in _HDR_PATTERNS]
+# --- Section-aware splitting (simple SOP heuristics) --------------------------
+_SECTION_NUM_RE = re.compile(r'^\s*(\d+(?:\.\d+){0,3})\s+([A-Z][^\n]{0,120})$')  # e.g., "6.1 Create, Modify, or Deactivate Accounts"
+_EXHIBIT_RE     = re.compile(r'^\s*Exhibit\s+\d+', re.IGNORECASE)
+def split_into_sections(clean_pages: List[str]) -> List[Tuple[int, int, Optional[str], str]]:
+    """
+    Produces section-sized blocks with accurate page spans.
+    Returns a list of (page_start, page_end, section_title_or_None, section_text).
+    """
+    sections: List[Tuple[int,int,Optional[str],str]] = []
+
+    def flush(curr_pages: List[Tuple[int,str]], title: Optional[str]):
+        if not curr_pages:
+            return
+        p1 = curr_pages[0][0]
+        p2 = curr_pages[-1][0]
+        body = "\n\n".join([t for _, t in curr_pages]).strip()
+        if body:
+            sections.append((p1, p2, title, body))
+
+    current: List[Tuple[int,str]] = []
+    current_title: Optional[str] = None
+
+    for pi, raw in enumerate(clean_pages, start=1):
+        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+        # Detect a heading at the top of a page OR anywhere in lines.
+        found_title = None
+        for ln in lines[:6]:  # look near the top; SOP headings usually sit here
+            if _SECTION_NUM_RE.match(ln) or _EXHIBIT_RE.match(ln):
+                found_title = ln
+                break
+
+        if found_title:
+            # start a new section
+            flush(current, current_title)
+            current = [(pi, raw)]
+            current_title = found_title
+        else:
+            # continue current section
+            current.append((pi, raw))
+
+    flush(current, current_title)
+    return sections
 
 def clean_for_prompt(txt: str) -> str:
     lines = [l.strip() for l in txt.splitlines()]
@@ -467,7 +509,9 @@ class ChunkItem(BaseModel):
 
 class ClearDBPayload(BaseModel):
     confirm:str
-
+class DeleteDocPayload(BaseModel):
+    confirm:str
+    doc_id:str
 # ---------------------------
 # Endpoints
 # ---------------------------
@@ -621,32 +665,7 @@ def query(payload: QueryPayload):
         return [t for t in terms if len(t) > 1]
   
   
-    # --- Similarity cutoff: bail out if the best hit is too weak -------------------
-    # scores = [s for s in (_score(h) for h in hits_vector) if s is not None]
-    # best = max(scores) if scores else 0.0
-    # if best < MIN_SIMILARITY:
-    #     return {
-    #         "answer": "I couldn't find a strong match for your question.",
-    #         "citations": [],
-    #         # optional debug info if you enabled it
-    #         **({"debug": {"vector_hits": len(hits_vector), "best_score": best}} if getattr(payload, "debug", False) else {})
-    #     }
-    # -------------------------------------------------------------------------------
-    lex_scores = {h['chunk_id']: lexical_score(h['text'], payload.question) for h in hits_vector}
-    has_lex_hits = any(v > 0 for v in lex_scores.values())
-
-    # after we build `hits` via RRF and slice to top_k:
-    # Optional post-fusion cutoff: only apply if NO lexical hits
-    if not has_lex_hits:
-        scores = [s for s in (_score(h) for h in hits) if s is not None]
-        best = max(scores) if scores else 0.0
-        if best < MIN_SIMILARITY:
-            return {
-                "answer": "I couldn't find a strong match for your question.",
-                "citations": [],
-                **({"debug": {"vector_hits": len(hits_vector), "best_fused_score": best}} if getattr(payload, "debug", False) else {})
-            }
-
+ 
 
     # --- Hybrid ranking with reciprocal-rank fusion -------------------------------
     # 1) Build a rank map for vector hits (rank 1 = best)
@@ -673,47 +692,63 @@ def query(payload: QueryPayload):
     # Sort chunks by fused score (desc)
     ranked = sorted(hits_vector, key=lambda h: rrf_scores[h['chunk_id']], reverse=True)
     # --- Doc-level gating: choose the best document(s) first ----------------------
-    from collections import defaultdict
-    
-    # Aggregate per-doc stats: best lexical hit and best RRF
-    doc_stats = defaultdict(lambda: {"lex": 0, "max_rrf": 0.0})
+   
+    # --------------------------from collections import defaultdict
+
+    doc_stats = defaultdict(lambda: {"lex_sum": 0, "max_rrf": 0.0})
     for h in hits_vector:
         did = h["doc_id"]
         cid = h["chunk_id"]
-        doc_stats[did]["lex"] = max(doc_stats[did]["lex"], lex_scores.get(cid, 0))
+        doc_stats[did]["lex_sum"] += max(0, lex_scores.get(cid, 0))
         doc_stats[did]["max_rrf"] = max(doc_stats[did]["max_rrf"], rrf_scores[cid])
 
-    # Rank docs: prefer docs with any lexical hit; break ties by max_rrf
-    doc_order = sorted(
-        doc_stats.items(),
-        key=lambda kv: (kv[1]["lex"] > 0, kv[1]["max_rrf"]),
-        reverse=True,
-    )
-    # Keep only the best 1–2 docs:
-    # - If the best doc has lexical hits, keep just 1 (very specific questions like PTO)
-    # - Otherwise keep top 2 as a fallback
-    TOP_DOCS = 1 if (doc_order and doc_order[0][1]["lex"] > 0) else 2
-    allowed_docs = set(d for d, _ in doc_order[:TOP_DOCS])
-    
-    # --- Group by doc_id and keep the best N per doc (N=2 is a good default)
+    # Pick the single best doc by (has lexical hits first, then fused strength)
+    def _doc_key(item):
+        did, s = item
+        return (s["lex_sum"] > 0, s["max_rrf"])
+
+    best_doc = None
+    if doc_stats:
+        best_doc = max(doc_stats.items(), key=_doc_key)[0]
+
+    # Keep ONLY the best doc if it has any lexical signal; otherwise keep top 2 docs by fused
+    if best_doc and doc_stats[best_doc]["lex_sum"] > 0:
+        allowed_docs = {best_doc}
+    else:
+        # no lexical signal → allow top 2 by fused as fallback
+        top2 = sorted(doc_stats.items(), key=_doc_key, reverse=True)[:2]
+        allowed_docs = {d for d, _ in top2}
+
+    # Filter ranked chunks to allowed docs
+    ranked = [h for h in ranked if h["doc_id"] in allowed_docs]
+
+    # Keep best N per doc (as before)
     BEST_PER_DOC = 2
-    by_doc = {}
+    per_doc = defaultdict(list)
     for h in ranked:
-        did = h["doc_id"]
-        bucket = by_doc.setdefault(did, [])
-        if len(bucket) < BEST_PER_DOC:
-            bucket.append(h)
-    # Flatten groups back into a list, preserving doc order by best rank
-    grouped = []
-    for did, _ in doc_order:
-        if did in by_doc:
-            grouped.extend(by_doc[did])
-        
-    # Now cap to top_k
-    hits = grouped[:payload.top_k] 
+        if len(per_doc[h["doc_id"]]) < BEST_PER_DOC:
+            per_doc[h["doc_id"]].append(h)
+
+    # Flatten in doc order (best doc first)
+    hits = []
+    for did, _ in sorted(((d, doc_stats[d]) for d in allowed_docs), key=_doc_key, reverse=True):
+        hits.extend(per_doc.get(did, []))
+    hits = hits[:payload.top_k]
     
-    # -------------------------------------------------------------------------------
-    # Build a metadata map: doc_id -> {title, source_url}
+
+    # Only now that lex_scores and hits exist, decide on cutoff
+    has_lex_hits = any(v > 0 for v in lex_scores.values())
+    if not has_lex_hits:
+        scores = [s for s in (_score(h) for h in hits) if s is not None]
+        best = max(scores) if scores else 0.0
+        if best < MIN_SIMILARITY:
+            return {
+                "answer": "I couldn't find a strong match for your question.",
+                "citations": [],
+                **({"debug": {"vector_hits": len(hits_vector), "best_fused_score": best}} if getattr(payload, "debug", False) else {})
+            }
+    #-----------------------------------------------------
+    
     doc_meta = {}
     for h in hits:
         did = h.get("doc_id")
@@ -749,6 +784,10 @@ def query(payload: QueryPayload):
             "page_start": p1,
             "page_end": p2,
         })
+    # Only cite from allowed docs (safety net)
+    allowed_doc_ids = {h["doc_id"] for h in hits}
+    citations = [c for c in citations if c["doc_id"] in allowed_doc_ids]
+    
     # De-duplicate identical doc/page citations
     seen = set()
     dedup = []
@@ -758,7 +797,7 @@ def query(payload: QueryPayload):
             continue
         seen.add(key)
         dedup.append(c)
-    citations = dedup
+    citations = dedup[:5]  # cap to 5 neat cites
     
     # Generate the answer as before
     answer = answer_with_context(payload.question, contexts)
@@ -841,7 +880,137 @@ def get_document_with_chunks(doc_id: str):
         "chunk_count": len(chunks),
         "chunks": chunks
     }
+@app.delete("/documents/{doc_id}")
+def delete_document(payload:DeleteDocPayload):
+    """
+    Delete ONE document and all its chunks.
+    Safety check: requires confirm=DELETE (query param) to proceed.
+    Example: DELETE /documents/22da2d3c-...-f714300e3ddf?confirm=DELETE
+    """
+    if payload.confirm != "DELETE":
+        raise HTTPException(status_code=400, detail="Confirmation missing. Append ?confirm=DELETE to proceed.")
 
+    conn = get_db()
+    docs_tbl, chunks_tbl = get_or_create_tables(conn)
+
+    # Count chunks before delete (best-effort; ignore large-corpus cost)
+    to_del = list(chunks_tbl.search().where(f"doc_id == '{payload.doc_id}'").limit(1_000_000).to_list())
+    chunk_count = len(to_del)
+
+    # Delete chunks then the document metadata
+    chunks_tbl.delete(f"doc_id == '{payload.doc_id}'")
+    docs_tbl.delete(f"doc_id == '{payload.doc_id}'")
+
+    return {"status": "ok", "doc_id": payload.doc_id, "deleted_chunks": chunk_count}
+
+from fastapi import Query
+
+class ReindexPayload(BaseModel):
+    mode: str = "full"    # "full" (re-download & re-extract) or "reembed"
+@app.post("/reindex/{doc_id}")
+async def reindex_document(doc_id: str, payload: ReindexPayload):
+    """
+    Re-run extraction/chunking/embedding for ONE document.
+
+    modes:
+      - "full" (default): re-download from source_url and fully re-extract
+      - "reembed": if no source_url (or download fails), rebuild from existing chunks:
+                   concatenate text -> clean -> re-chunk -> re-embed
+    """
+    conn = get_db()
+    docs_tbl, chunks_tbl = get_or_create_tables(conn)
+
+    # Look up doc row
+    rows = docs_tbl.search().where(f"doc_id == '{doc_id}'").to_list()
+    if not rows:
+        raise HTTPException(status_code=404, detail="Document not found")
+    d = rows[0]
+    source_url = d.get("source_url")
+    title      = d.get("title")
+    etag       = d.get("etag")
+    last_mod   = d.get("last_modified")
+
+    mode = (payload.mode or "full").lower().strip()
+
+    # Preferred path: FULL re-extract (if we have a source_url)
+    if mode in ("full", "auto") and source_url:
+        try:
+            async with httpx.AsyncClient(follow_redirects=True, timeout=60) as s:
+                r = await s.get(source_url)
+                r.raise_for_status()
+                pdf_bytes = r.content
+        except Exception as ex:
+            if mode == "full":
+                raise HTTPException(status_code=502, detail=f"Download failed from source_url: {ex}")
+            pdf_bytes = None
+        if pdf_bytes:
+            # Re-ingest using the same doc_id + metadata, forcing past the SHA check
+            return _ingest_common(
+                pdf_bytes=pdf_bytes,
+                doc_id=doc_id,
+                source_url=source_url,
+                etag=etag,
+                last_modified=last_mod,
+                title=title,
+                force=True
+            )
+
+    # Fallback: RE-EMBED from existing chunk text (no PDF needed)
+    #  - Pull current chunks, rebuild text, re-clean+re-chunk, re-embed.
+    ch_rows = chunks_tbl.search().where(f"doc_id == '{doc_id}'").limit(1_000_000).to_list()
+    if not ch_rows:
+        raise HTTPException(status_code=400, detail="No chunks to re-embed and no source_url available.")
+
+    # Rebuild a "document" string in page order if possible
+    # Group by (page_start), then concatenate
+    ch_rows_sorted = sorted(ch_rows, key=lambda r: (int(r.get("page_start", 1)), r.get("chunk_id", "")))
+    rebuilt_pages: Dict[int, List[str]] = {}
+    for r in ch_rows_sorted:
+        p = int(r.get("page_start", 1))
+        rebuilt_pages.setdefault(p, []).append(r.get("text", ""))
+
+    page_texts = ["\n".join(rebuilt_pages[p]) for p in sorted(rebuilt_pages.keys())]
+    # Clean using your existing boilerplate remover
+    clean_pages = remove_boilerplate(page_texts)
+    text = "\n\n".join(clean_pages)
+    page_offsets = build_page_offsets(clean_pages)
+    new_chunks = chunk_text(text, page_offsets=page_offsets)
+
+    # Re-embed & replace chunks
+    texts = [c[2] for c in new_chunks]
+    vecs = embed_texts(texts)
+
+    # Delete existing chunks for this doc
+    chunks_tbl.delete(f"doc_id == '{doc_id}'")
+
+    rows_to_add = []
+    for (pgs, pge, t), v in zip(new_chunks, vecs):
+        header = make_chunk_header(doc_id, title, pgs, pge)
+        rows_to_add.append({
+            "doc_id": doc_id,
+            "chunk_id": hashlib.sha1((doc_id + t[:64]).encode("utf-8")).hexdigest(),
+            "page_start": pgs,
+            "page_end": pge,
+            "text": f"{header}\n\n{t}",
+            "embedding": v
+        })
+    chunks_tbl.add(rows_to_add)
+
+    # Keep document row as-is; update timestamp so you can see it changed
+    docs_tbl.delete(f"doc_id == '{doc_id}'")
+    docs_tbl.add([{
+        "doc_id": doc_id,
+        "source_url": source_url,
+        "title": title,
+        "sha256": d.get("sha256"),        # unchanged here (we didn't re-hash the original bytes)
+        "etag": etag,
+        "last_modified": last_mod,
+        "page_count": d.get("page_count"),
+        "mime_type": d.get("mime_type"),
+        "ingested_at": datetime.utcnow().isoformat() + "Z"
+    }])
+
+    return {"status": "ok", "doc_id": doc_id, "mode": "reembed", "chunks": len(rows_to_add)}
 @app.post("/admin/clear_db")
 def clear_db(payload:ClearDBPayload):
     """
@@ -860,6 +1029,18 @@ def clear_db(payload:ClearDBPayload):
 
     return {"status": "ok", "message": "All tables cleared (documents, chunks)."}
 
+def make_chunk_header(doc_id: str, title: Optional[str], p1: int, p2: int, section: Optional[str] = None) -> str:
+    """
+    Build a short, authoritative header that improves retrieval and reranking.
+    Example: "Access Control | 386b...e14 | p.2-3"  (title | doc_id | page range)
+    """
+    parts = []
+    if title: parts.append(title.strip())
+    if section: parts.append(section.strip())
+    parts.append(doc_id)
+    parts.append(f"p.{p1}-{p2}")
+    return " | ".join(parts)
+
 
 # ---------------------------
 # Internal common ingest
@@ -870,7 +1051,8 @@ def _ingest_common(
     source_url: Optional[str],
     etag: Optional[str],
     last_modified: Optional[str],
-    title: Optional[str]
+    title: Optional[str],
+    force:bool =False
 ):
     if not pdf_bytes:
         raise HTTPException(status_code=400, detail="Empty file")
@@ -887,7 +1069,7 @@ def _ingest_common(
 
     # unchanged short-circuit
     existing = list(docs.search().where(f"doc_id == '{doc_id}'").to_list())
-    if existing and existing[0]["sha256"] == sha:
+    if  (not force) and existing and existing[0]["sha256"] == sha:
         return {"status": "skipped", "reason": "unchanged", "doc_id": doc_id}
 
     # delete any previous chunks for this doc_id
@@ -897,23 +1079,42 @@ def _ingest_common(
     clean_pages = remove_boilerplate(page_texts)
     
     # Rebuild full text from cleaned pages (preserving page joins with \n\n)
-    text = "\n\n".join(clean_pages)
+    #text = "\n\n".join(clean_pages)
     
     # Build offsets so we can map chunk character positions to real pages
-    page_offsets = build_page_offsets(clean_pages)
+    #page_offsets = build_page_offsets(clean_pages)
     # chunk + embed
-    ch = chunk_text(text, page_offsets=page_offsets)
-    texts = [c[2] for c in ch]
+    #ch = chunk_text(text, page_offsets=page_offsets)
+    #texts = [c[2] for c in ch]
+
+    # 1) Split into SOP sections (parent chunks)
+    parent_sections = split_into_sections(clean_pages)
+
+    # 2) For each section, only sub-split if it greatly exceeds size
+    ch: List[Tuple[int,int,str,str]] = []  # (p1,p2,section_title,chunk_text)
+    for (p1, p2, sec_title, sec_text) in parent_sections:
+        if len(sec_text) <= CHUNK_SIZE * 2:
+            ch.append((p1, p2, sec_title or None, sec_text))
+        else:
+            # sub-split within this section (preserve its page span using local offsets)
+            local_pages = [sec_text]  # treat as one "page" for mapping
+            local_offsets = build_page_offsets(local_pages)
+            for (sp1, sp2, sub) in chunk_text(sec_text, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP, page_offsets=local_offsets):
+                # keep the section page range, not the local 1..1
+                ch.append((p1, p2, sec_title or None, sub))
+
+    texts = [c[3] for c in ch]
     vecs = embed_texts(texts)
 
     rows = []
-    for (pgs, pge, t), v in zip(ch, vecs):
+    for (pgs, pge, sec_title, t), v in zip(ch, vecs):
+        header = make_chunk_header(doc_id, title, pgs, pge, section=sec_title)
         rows.append({
             "doc_id": doc_id,
             "chunk_id": hashlib.sha1((doc_id + t[:64]).encode("utf-8")).hexdigest(),
             "page_start": pgs,
             "page_end": pge,
-            "text": t,
+            "text": f"{header}\n\n{t}",
             "embedding": v
         })
     chunks_tbl.add(rows)
