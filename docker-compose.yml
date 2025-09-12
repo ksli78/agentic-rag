@@ -2,11 +2,19 @@ services:
   ollama:
     image: ollama/ollama:latest
     restart: unless-stopped
-    ports: ["11434:11434"]
+    ports:
+      - "11434:11434"
+    # If you want GPU for Ollama too, enable one of the following:
+    # gpus: all       # for Docker Desktop / compose v2
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: ["gpu"]
     volumes:
       - ollama:/root/.ollama
     healthcheck:
-      test: ["CMD","ollama","list"]
+      test: ["CMD", "ollama", "list"]
       interval: 10s
       timeout: 3s
       retries: 20
@@ -15,9 +23,17 @@ services:
   api:
     build:
       context: ./fastapi
+      # dockerfile: Dockerfile  # optional if your file is named Dockerfile
     depends_on:
       ollama:
         condition: service_healthy
+    # Enable GPU for the API service
+    # gpus: all       # for Docker Desktop / compose v2
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: ["gpu"]
     environment:
       - OLLAMA_HOST=http://ollama:11434
       - OLLAMA_EMBED_MODEL=embeddinggemma:latest
@@ -25,24 +41,15 @@ services:
       - LANCEDB_URI=/data/lancedb
       - CHUNK_SIZE=1200
       - CHUNK_OVERLAP=200
+      # Optional Marker+Ollama settings
+      - USE_MARKER=true
+      - MARKER_USE_LLM=true
+      - MARKER_OLLAMA_MODEL=llama3:8b
+      - MARKER_DEVICE=cuda
     volumes:
-      - lancedb:/data
+      - lancedb:/data/lancedb
     ports:
       - "8000:8000"
-
-  app:
-    build:
-      context: ./app
-    depends_on:
-      ollama:
-        condition: service_healthy
-    environment:
-      - OLLAMA_HOST=http://ollama:11434
-      - LANCEDB_URI=/data/lancedb
-    volumes:
-      - lancedb:/data
-    ports:
-      - "8501:8501"
 
 volumes:
   ollama:
