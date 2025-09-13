@@ -120,6 +120,38 @@ def chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) 
         start = max(0, end - overlap)
     return chunks
 
+def determine_question_category(question: str) -> Optional[str]:
+    """
+    Quickly identify whether the question is about a policy or a procedure.
+    If the text explicitly contains 'policy' or 'procedure', return that.
+    Otherwise use the LLM to decide (returns 'policy', 'procedure', or 'other').
+    """
+    lower_q = question.lower()
+    if "policy" in lower_q:
+        return "policy"
+    if "procedure" in lower_q:
+        return "procedure"
+
+    # Fall back to LLM classification
+    system_prompt = (
+        "You are an expert at classifying user questions about documents.  "
+        "Given a question, decide if the user is primarily interested in a policy, "
+        "a procedure, or neither.  Respond with exactly one word: policy, procedure, or other."
+    )
+    resp = client.chat(
+        model=GEN_MODEL,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": question}
+        ],
+        options={"temperature": 0.0}
+    )
+    ans = (resp["message"]["content"] or "").strip().lower()
+    for w in ("policy", "procedure", "other"):
+        if w in ans:
+            return w
+    return None
+
 
 # ---------------------------
 # Embeddings / Generation
@@ -441,35 +473,145 @@ def ingest_text(payload: IngestText):
     return {"status": "ok", "doc_id": doc_id, "chunks": len(rows)}
 
 
+from fastapi import HTTPException
+import re
+
+# -----------------------------------------
+# Query Endpoint with category + keyword logic
+# -----------------------------------------
+
 @app.post("/query")
 def query(payload: QueryPayload):
+    """
+    Enhanced query endpoint with lexical fallback.
+    - Tokenizes the question.
+    - If any document's title or keywords contain a token, returns those docs' chunks directly.
+    - Otherwise runs semantic search with category/keyword re-ranking.
+    - Citations include doc_id, title, source_url, and page range.
+    """
+    question = payload.question or ""
+    top_k = payload.top_k
+    if not question.strip():
+        raise HTTPException(status_code=400, detail="Empty question")
+
     conn = get_db()
-    _, chunks_tbl = get_or_create_tables(conn)
+    docs, chunks_tbl = get_or_create_tables(conn)
 
-    # embed question
-    qvec = embed_texts([payload.question])[0]
+    # Load all documents into a dict
+    all_docs = docs.search().to_list()
+    doc_map = {d["doc_id"]: d for d in all_docs}
 
-    # vector search
-    hits = chunks_tbl.search(qvec).limit(payload.top_k).to_list()
+    # Tokenize the question
+    tokens = [tok for tok in re.findall(r"[a-zA-Z0-9']+", question.lower()) if tok]
 
-    if not hits:
+    # Lexical fallback: find docs whose title or keywords contain any token
+    matched_docs = []
+    for d in all_docs:
+        title_l = (d.get("title") or "").lower()
+        kws_l = [kw.lower() for kw in (d.get("keywords") or [])]
+        if any(tok in title_l for tok in tokens) or any(tok in kws_l for tok in tokens):
+            matched_docs.append(d)
+
+    # If lexical matches exist, return those documents' chunks
+    if matched_docs:
+        contexts = []
+        # Limit to top_k documents to keep the response concise
+        for doc in matched_docs[:top_k]:
+            doc_id = doc["doc_id"]
+            # Fetch the first chunk for the matched doc
+            chunks = chunks_tbl.search().where(f"doc_id == '{doc_id}'").limit(1).to_list()
+            if chunks:
+                ch = chunks[0]
+                contexts.append({
+                    "doc_id": doc_id,
+                    "page_start": int(ch.get("page_start", 1)),
+                    "page_end": int(ch.get("page_end", 1)),
+                    "text": ch["text"]
+                })
+
+        # If we have contexts, build answer and citations
+        if contexts:
+            answer = answer_with_context(question, contexts)
+            citations = []
+            for c in contexts:
+                meta = doc_map.get(c["doc_id"], {})
+                citations.append({
+                    "doc_id": c["doc_id"],
+                    "title": meta.get("title"),
+                    "source_url": meta.get("source_url"),
+                    "page_start": c["page_start"],
+                    "page_end": c["page_end"],
+                })
+            return {"answer": answer, "citations": citations}
+
+    # -----------------------------------------------------------
+    # No lexical matches; fall back to semantic search + re-ranking
+    # -----------------------------------------------------------
+
+    # Determine question category via heuristic/LLM
+    category = determine_question_category(question)
+
+    # Get vector for question
+    qvec = embed_texts([question])[0]
+
+    # Candidate generation via semantic search
+    vector_hits = chunks_tbl.search(qvec).limit(top_k * 5).to_list()
+
+    # Also gather docs that share any keyword with the question
+    keyword_docs = set()
+    for d in all_docs:
+        kws_l = [kw.lower() for kw in (d.get("keywords") or [])]
+        if any(tok in kws_l for tok in tokens):
+            keyword_docs.add(d["doc_id"])
+
+    # Add up to two chunks from each keyword-matched doc
+    keyword_hits = []
+    for doc_id in keyword_docs:
+        keyword_hits.extend(chunks_tbl.search().where(f"doc_id == '{doc_id}'").limit(2).to_list())
+
+    # Combine and re-rank
+    all_hits = vector_hits + keyword_hits
+    if not all_hits:
         return {"answer": "I couldn't find relevant content.", "citations": []}
 
-    # build citations + context
+    candidates = []
+    for idx, hit in enumerate(all_hits):
+        doc_id = hit["doc_id"]
+        meta = doc_map.get(doc_id, {})
+        # Keyword score: high if doc_id is in keyword_docs; else count overlapping keywords
+        kw_score = 10 if doc_id in keyword_docs else sum(
+            1 for kw in (meta.get("keywords") or []) if kw.lower() in question.lower()
+        )
+        cat_score = 1 if category and meta.get("category") == category else 0
+        candidates.append((hit, kw_score, cat_score, idx))
+
+    candidates.sort(key=lambda t: (-t[1], -t[2], t[3]))
+    top_hits = [h for h, _, _, _ in candidates[:top_k]]
+
+    # Build contexts and answer
     contexts = []
-    for h in hits:
+    for h in top_hits:
         contexts.append({
             "doc_id": h["doc_id"],
             "page_start": int(h.get("page_start", 1)),
             "page_end": int(h.get("page_end", 1)),
             "text": h["text"]
         })
+    answer = answer_with_context(question, contexts)
 
-    answer = answer_with_context(payload.question, contexts)
+    # Build citations with title and URL
+    citations = []
+    for c in contexts:
+        meta = doc_map.get(c["doc_id"], {})
+        citations.append({
+            "doc_id": c["doc_id"],
+            "title": meta.get("title"),
+            "source_url": meta.get("source_url"),
+            "page_start": c["page_start"],
+            "page_end": c["page_end"],
+        })
 
-    # compact citations
-    cset = [{"doc_id": c["doc_id"], "page_start": c["page_start"], "page_end": c["page_end"]} for c in contexts]
-    return {"answer": answer, "citations": cset}
+    return {"answer": answer, "citations": citations}
 
 
 @app.get("/documents")
