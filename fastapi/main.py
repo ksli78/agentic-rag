@@ -20,6 +20,14 @@ from lancedb import LanceDBConnection
 from lancedb.pydantic import LanceModel, Vector
 
 import ollama  # python client for Ollama
+import tempfile
+
+import json
+import re
+
+
+from langchain_docling import DoclingLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 # ---------------------------
 # Environment / Config
@@ -35,6 +43,32 @@ LANCEDB_URI = os.getenv("LANCEDB_URI", "/data/lancedb")
 # Chunking knobs (characters)
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1200"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))
+
+#NOISE FILTERING 
+NOISE_STARTS_WITH = [
+    "This document contains",     # proprietary info header
+    "Unauthorized use",           # part of the banner
+    "Uncontrolled if",            # uncontrolled copy notice
+    "Before using this document",
+    "Copyright",
+    "All rights reserved",
+    "CUI",
+    "Controlled Unclassified",
+    "Privacy Act",
+    "Sensitive but unclassified"
+]
+
+NOISE_REGEX = [
+    re.compile(r"\bproprietary information\b", re.IGNORECASE),
+    re.compile(r"\bunauthorized use\b", re.IGNORECASE),
+    re.compile(r"\buncontrolled if printed\b", re.IGNORECASE),
+    re.compile(r"\ball rights reserved\b", re.IGNORECASE),
+    re.compile(r"\bCUI\b", re.IGNORECASE),
+    re.compile(r"\bControlled Unclassified\b", re.IGNORECASE),
+    re.compile(r"\bPrivacy Act\b", re.IGNORECASE),
+    re.compile(r"\bSensitive but unclassified\b", re.IGNORECASE)
+]
+
 
 # Ollama client
 client = ollama.Client(host=OLLAMA_HOST)
@@ -90,6 +124,25 @@ def get_or_create_tables(conn: LanceDBConnection):
 # ---------------------------
 # Utility helpers
 # ---------------------------
+def remove_noise(text: str) -> str:
+    """
+    Remove lines that start with known noise phrases or match noise patterns.
+    """
+    cleaned_lines = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        # skip empty lines early to reduce pattern checks
+        if not stripped:
+            cleaned_lines.append(line)
+            continue
+        # check if the line starts with any banned phrase
+        if any(stripped.lower().startswith(p.lower()) for p in NOISE_STARTS_WITH):
+            continue
+        # check regex patterns
+        if any(r.search(stripped) for r in NOISE_REGEX):
+            continue
+        cleaned_lines.append(line)
+    return "\n".join(cleaned_lines)
 
 def sha256_bytes(data: bytes) -> str:
     h = hashlib.sha256()
@@ -191,9 +244,6 @@ def answer_with_context(question: str, contexts: List[Dict[str, Any]]) -> str:
         options={"temperature": 0.2}
     )
     return resp["message"]["content"]
-
-import json
-import re
 
 def extract_extra_metadata(markdown: str) -> Tuple[Optional[str], List[str]]:
     """
@@ -471,11 +521,6 @@ def ingest_text(payload: IngestText):
     }])
 
     return {"status": "ok", "doc_id": doc_id, "chunks": len(rows)}
-
-
-from fastapi import HTTPException
-import re
-
 # -----------------------------------------
 # Query Endpoint with category + keyword logic
 # -----------------------------------------
@@ -669,62 +714,100 @@ def _ingest_common(
     last_modified: Optional[str],
     title: Optional[str]
 ):
+    """
+    Ingest a PDF using Docling + LangChain.  Parses the PDF with DoclingLoader,
+    cleans out banner/CUI/copyright lines, splits into chunks, embeds them,
+    uses an LLM to extract category and keywords, and stores everything in LanceDB.
+    """
     if not pdf_bytes:
         raise HTTPException(status_code=400, detail="Empty file")
 
-    # Compute metadata first
-    text, pcount = extract_pdf_text_and_pages(pdf_bytes)
+    # Write PDF bytes to a temporary file for DoclingLoader
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(pdf_bytes)
+        tmp_path = tmp.name
+
+    try:
+        loader = DoclingLoader(tmp_path)
+        documents = loader.load()
+    finally:
+        os.unlink(tmp_path)
+
+    if not documents:
+        raise HTTPException(status_code=400, detail="Unable to parse PDF")
+
+    # Remove noise from each page's content
+    for doc in documents:
+        doc.page_content = remove_noise(doc.page_content)
+
+    # Compute SHA of the raw PDF for deduplication
     sha = sha256_bytes(pdf_bytes)
-    # Stable id: prefer caller's doc_id, else hash of URL (or file hash)
+
+    # Derive stable doc_id
     base_for_id = (source_url or sha)[:64]
     doc_id = doc_id or hashlib.sha1(base_for_id.encode("utf-8")).hexdigest()
 
     conn = get_db()
-    docs, chunks_tbl = get_or_create_tables(conn)
+    docs_tbl, chunks_tbl = get_or_create_tables(conn)
 
-    # unchanged short-circuit
-    existing = list(docs.search().where(f"doc_id == '{doc_id}'").to_list())
+    # Skip if unchanged
+    existing = list(docs_tbl.search().where(f"doc_id == '{doc_id}'").to_list())
     if existing and existing[0]["sha256"] == sha:
         return {"status": "skipped", "reason": "unchanged", "doc_id": doc_id}
 
-    # delete previous chunks for this doc_id
+    # Delete old chunks
     chunks_tbl.delete(f"doc_id == '{doc_id}'")
 
-    # chunk + embed
-    ch = chunk_text(text, CHUNK_SIZE, CHUNK_OVERLAP)
-    texts = [c[2] for c in ch] if ch else [text]
-    vecs = embed_texts(texts)
+    # Split using LangChain's text splitter
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+        length_function=len,
+    )
+    split_docs = splitter.split_documents(documents)
+
+    # Prepare texts and embeddings
+    texts = [d.page_content for d in split_docs]
+    embeddings = embed_texts(texts)
 
     rows = []
-    # If chunking yielded nothing (empty doc), bail gracefully
-    if not ch:
-        ch = [(1, 1, text)]
-
-    for (pgs, pge, t), v in zip(ch, vecs):
+    for doc_obj, vec in zip(split_docs, embeddings):
+        meta = doc_obj.metadata or {}
+        page_start = int(meta.get("page", 1))
+        page_end = page_start
+        content = doc_obj.page_content
         rows.append({
             "doc_id": doc_id,
-            "chunk_id": hashlib.sha1((doc_id + t[:64]).encode("utf-8")).hexdigest(),
-            "page_start": pgs,
-            "page_end": pge,
-            "text": t,
-            "embedding": v
+            "chunk_id": hashlib.sha1((doc_id + content[:64]).encode("utf-8")).hexdigest(),
+            "page_start": page_start,
+            "page_end": page_end,
+            "text": content,
+            "embedding": vec
         })
+
     if rows:
         chunks_tbl.add(rows)
 
-    # upsert document metadata
-    docs.delete(f"doc_id == '{doc_id}'")
-    docs.add([
-        {
-            "doc_id": doc_id,
-            "source_url": source_url,
-            "title": title,
-            "sha256": sha,
-            "etag": etag,
-            "last_modified": last_modified,
-            "page_count": pcount,
-            "ingested_at": datetime.utcnow().isoformat() + "Z",
-        }
-    ])
+    # Use the full cleaned text to extract category and keywords
+    full_text = "\n\n".join([d.page_content for d in documents])
+    category, keywords = extract_extra_metadata(full_text)
+
+    # Page count equals number of original Docling Documents
+    page_count = len(documents)
+
+    # Upsert document metadata
+    docs_tbl.delete(f"doc_id == '{doc_id}'")
+    docs_tbl.add([{
+        "doc_id": doc_id,
+        "source_url": source_url,
+        "title": title,
+        "sha256": sha,
+        "etag": etag,
+        "last_modified": last_modified,
+        "page_count": page_count,
+        "ingested_at": datetime.utcnow().isoformat() + "Z",
+        "category": category,
+        "keywords": keywords
+    }])
 
     return {"status": "ok", "doc_id": doc_id, "chunks": len(rows)}
