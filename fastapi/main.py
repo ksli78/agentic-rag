@@ -56,6 +56,9 @@ class Document(LanceModel):
     page_count: Optional[int] = None
     mime_type: Optional[str] = "application/pdf"
     ingested_at: str
+    # New fields
+    category: Optional[str] = None  # e.g. “policy”, “procedure”
+    keywords: Optional[List[str]] = None  # extracted key phrases
 
 
 class Chunk(LanceModel):
@@ -157,6 +160,66 @@ def answer_with_context(question: str, contexts: List[Dict[str, Any]]) -> str:
     )
     return resp["message"]["content"]
 
+import json
+import re
+
+def extract_extra_metadata(markdown: str) -> Tuple[Optional[str], List[str]]:
+    """
+    Use the LLM to classify the document type (policy/procedure/other)
+    and extract keywords.  The prompt instructs the model to return
+    only a JSON object.  The parser is tolerant of extra text.
+    """
+    system_prompt = (
+        "You are an expert document analyst.  Given a document’s Markdown content, "
+        "classify it as one of these categories: 'policy', 'procedure', or 'other'.  "
+        "Then extract 5–10 concise keywords (single words or short phrases) that best "
+        "describe its subject.  IMPORTANT: Return only a JSON object with the keys "
+        "'category' and 'keywords'—do not include explanations, markdown, or code fences."
+    )
+
+    # Send a truncated excerpt to keep token usage reasonable
+    excerpt = markdown[:5000]
+    resp = client.chat(
+        model=GEN_MODEL,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": excerpt}
+        ],
+        options={"temperature": 0.0}  # low temperature improves determinism
+    )
+    content = resp["message"]["content"]
+
+    print(content)
+
+    json_match = re.search(r"```(?:json)?\s*({.*?})\s*```|({.*})", content, re.DOTALL)
+    
+    if json_match:
+        # Extract the content of the matched group
+        json_str = json_match.group(1) or json_match.group(2)
+        
+        # Clean up the string to ensure it's valid JSON
+        json_str = json_str.replace("`", "").strip()
+
+        try:
+            data = json.loads(json_str)
+            cat = data.get("category")
+            kws = data.get("keywords", [])
+            
+            # Additional validation to ensure keywords is a list
+            if not isinstance(kws, list):
+                kws = []
+                
+            return cat, kws
+            
+        except json.JSONDecodeError as e:
+            # Log the error for debugging
+            print(f"Failed to decode JSON: {e}")
+            print(f"Attempted to parse: {json_str}")
+            return None, []
+    
+    # If no JSON pattern is found
+    return None, []
+
 
 # ---------------------------
 # Pydantic payloads
@@ -190,6 +253,18 @@ class DeleteDocumentPayload(BaseModel):
 class EraseDatabasePayload(BaseModel):
     confirm: str
 
+class IngestJsonPayload(BaseModel):
+    """
+    Expected payload for /ingest/json.  This mirrors the JSON produced
+    by the C# SharePoint crawler.
+    """
+    file_name: str
+    source_url: Optional[str] = None
+    doc_id: str
+    last_modified: Optional[str] = None
+    title: Optional[str] = None
+    metadata: Dict[str, Any]
+    markdown: str
 
 # ---------------------------
 # Endpoints
@@ -202,6 +277,73 @@ def health():
         return {"status": "ok"}
     except Exception as e:
         raise HTTPException(status_code=503, detail=str(e))
+
+@app.post("/ingest/json")
+def ingest_json(payload: IngestJsonPayload):
+    """
+    Accept a JSON object containing cleaned Markdown and original metadata.
+    Uses LLM to extract extra metadata (category and keywords) and stores
+    both the chunks and the metadata in the database.
+    """
+    text = payload.markdown or ""
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="Empty markdown")
+
+    # Derive a stable doc_id (prefer caller’s ID, else file name hash)
+    base_for_id = payload.doc_id or hashlib.sha1((payload.file_name + (payload.source_url or "")).encode("utf-8")).hexdigest()
+    doc_id = base_for_id
+
+    # Compute SHA of the markdown for change detection
+    sha = sha256_bytes(text.encode("utf-8"))
+    page_count = 1  # unknown; treat as 1 since we no longer have page boundaries
+
+    conn = get_db()
+    docs, chunks_tbl = get_or_create_tables(conn)
+
+    # If existing doc has same SHA, skip
+    existing = list(docs.search().where(f"doc_id == '{doc_id}'").to_list())
+    if existing and existing[0]["sha256"] == sha:
+        return {"status": "skipped", "reason": "unchanged", "doc_id": doc_id}
+
+    # Delete any existing chunks for this doc
+    chunks_tbl.delete(f"doc_id == '{doc_id}'")
+
+    # Chunk and embed
+    chunks = chunk_text(text, CHUNK_SIZE, CHUNK_OVERLAP)
+    texts = [c[2] for c in chunks] if chunks else [text]
+    embeddings = embed_texts(texts)
+
+    rows = []
+    for (pgs, pge, chunk_text_val), vec in zip(chunks if chunks else [(1, 1, text)], embeddings):
+        rows.append({
+            "doc_id": doc_id,
+            "chunk_id": hashlib.sha1((doc_id + chunk_text_val[:64]).encode("utf-8")).hexdigest(),
+            "page_start": pgs,
+            "page_end": pge,
+            "text": chunk_text_val,
+            "embedding": vec
+        })
+    if rows:
+        chunks_tbl.add(rows)
+
+    # Extract extra metadata via LLM (category + keywords)
+    category, keywords = extract_extra_metadata(text)
+
+    # Upsert document metadata
+    docs.delete(f"doc_id == '{doc_id}'")
+    docs.add([{
+        "doc_id": doc_id,
+        "source_url": payload.source_url,
+        "title": payload.title or payload.file_name,
+        "sha256": sha,
+        "last_modified": payload.last_modified,
+        "page_count": page_count,
+        "ingested_at": datetime.utcnow().isoformat() + "Z",
+        "category": category,
+        "keywords": keywords
+    }])
+
+    return {"status": "ok", "doc_id": doc_id, "chunks": len(rows), "category": category, "keywords": keywords}
 
 
 @app.post("/ingest/url")
