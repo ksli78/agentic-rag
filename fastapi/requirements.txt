@@ -13,4 +13,10 @@
  # Satisfy marker-pdf’s constraint (>=4.45.2,<5)
  transformers==4.45.2
  tokenizers<0.21
+
+ pydantic==2.11.6
+ pydantic-core==2.33.2
+ annotated-types>=0.6.0
+ typing-inspection>=0.4.0
+
  Pillow==10.4.0

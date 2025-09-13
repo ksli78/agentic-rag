@@ -1,62 +1,50 @@
-# --- Base: lean Python; CUDA comes via PyTorch cu121 wheels ---
-FROM python:3.11-slim
-
-ENV DEBIAN_FRONTEND=noninteractive \
-    PIP_NO_CACHE_DIR=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
-
-# Small set of helpful tools
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      tini curl ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /app
-
-# ---- Requirements first (context is already fastapi/) ----
-# If your build context is fastapi/, requirements.txt is at the root of the context
-COPY requirements.txt /app/requirements.txt
-
-# Install CUDA-enabled PyTorch first (no torch in requirements.txt)
+# ===== Stage 1: vendor wheels (online only here) =====
+FROM python:3.11-slim AS wheels
 ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu121
+WORKDIR /vendor
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+COPY requirements.txt /vendor/requirements.txt
+
+# 1) Download CUDA Torch stack (cu121)
 RUN python -m pip install --upgrade pip setuptools wheel \
- && pip install --index-url ${TORCH_INDEX_URL} \
-      torch==2.3.1 torchvision==0.18.1 torchaudio==2.3.1
+ && pip download --dest /vendor/wheels --index-url ${TORCH_INDEX_URL} \
+      torch==2.2.2 torchvision==0.17.2 torchaudio==2.2.2
 
-# Then install the rest (this will bring in marker‑pdf 1.6.0 and transformers 4.45.2)
+# 2) Download ALL app deps (+ transitive) from PyPI
+#    (This now pulls pydantic, pydantic-core, annotated-types, typing-inspection, etc.)
+RUN pip download --dest /vendor/wheels -r /vendor/requirements.txt
+
+# ===== Stage 2: final runtime (offline) =====
+FROM python:3.11-slim
+WORKDIR /app
+COPY --from=wheels /vendor/wheels /wheels
 COPY requirements.txt /app/requirements.txt
-RUN pip install -r /app/requirements.txt
 
-# Re-assert CUDA torchvision to ensure no later step replaced it
-RUN pip install --no-deps --force-reinstall \
-    --index-url ${TORCH_INDEX_URL} \
-    "torchvision==0.18.1"
+# Install CUDA Torch stack offline
+RUN python -m pip install --upgrade pip setuptools wheel \
+ && pip install --no-index --find-links /wheels \
+      torch==2.2.2 torchvision==0.17.2 torchaudio==2.2.2
 
+# Install the rest offline (Marker/HF/Starlette/FastAPI etc.)
+RUN pip install --no-index --find-links /wheels -r /app/requirements.txt
 
-# ---- App code ----
-# IMPORTANT: because the build context is fastapi/, COPY . /app/ copies your main.py, etc.
+# Build-time NMS sanity check: fail image if nms missing
+RUN python - <<'PY'
+import torch, torchvision
+from torchvision.ops import nms
+print("Torch:", torch.__version__, "CUDA:", torch.version.cuda, "| TV:", torchvision.__version__)
+PY
+
+# App code
 COPY . /app/
 
-# (Optional) Warm Marker model caches into the image to help offline/air-gapped use.
-# Uncomment if you want to bake weights into the image:
-#RUN python - <<'PY'
-#from marker.models import create_model_dict
-#create_model_dict(device="cuda")
-#print("Marker models cached (cuda)")
-#PY
-
-# ---- Runtime env (override in compose if you like) ----
-ENV OLLAMA_HOST=http://ollama:11434 \
-    OLLAMA_EMBED_MODEL=embeddinggemma:latest \
-    OLLAMA_GEN_MODEL=llama3.2:latest \
-    USE_MARKER=true \
-    MARKER_USE_LLM=true \
-    MARKER_OLLAMA_MODEL=llama3:8b \
-    MARKER_DEVICE=cuda \
-    CHUNK_SIZE=1200 \
-    CHUNK_OVERLAP=200
+# Optional: warm marker models for fully offline prod
+RUN python - <<'PY'
+from marker.models import create_model_dict
+create_model_dict(device="cuda")
+print("Marker models cached (cuda)")
+PY
 
 EXPOSE 8000
-
-ENTRYPOINT ["/usr/bin/tini","--"]
 CMD ["uvicorn","main:app","--host","0.0.0.0","--port","8000"]
