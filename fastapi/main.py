@@ -182,6 +182,15 @@ class QueryPayload(BaseModel):
     top_k: int = 6
 
 
+class DeleteDocumentPayload(BaseModel):
+    doc_id: str
+    confirm: str
+
+
+class EraseDatabasePayload(BaseModel):
+    confirm: str
+
+
 # ---------------------------
 # Endpoints
 # ---------------------------
@@ -319,6 +328,47 @@ def query(payload: QueryPayload):
     # compact citations
     cset = [{"doc_id": c["doc_id"], "page_start": c["page_start"], "page_end": c["page_end"]} for c in contexts]
     return {"answer": answer, "citations": cset}
+
+
+@app.get("/documents")
+def list_documents():
+    conn = get_db()
+    docs, _ = get_or_create_tables(conn)
+    return {"documents": docs.to_list()}
+
+
+@app.get("/document/{doc_id}")
+def get_document(doc_id: str):
+    conn = get_db()
+    docs, chunks_tbl = get_or_create_tables(conn)
+    doc_rows = list(docs.search().where(f"doc_id == '{doc_id}'").to_list())
+    if not doc_rows:
+        raise HTTPException(status_code=404, detail="Document not found")
+    chunks = list(chunks_tbl.search().where(f"doc_id == '{doc_id}'").to_list())
+    return {"document": doc_rows[0], "chunks": chunks}
+
+
+@app.post("/delete")
+def delete_document(payload: DeleteDocumentPayload):
+    if payload.confirm != "DELETE":
+        raise HTTPException(status_code=400, detail="Confirmation mismatch")
+    conn = get_db()
+    docs, chunks_tbl = get_or_create_tables(conn)
+    docs.delete(f"doc_id == '{payload.doc_id}'")
+    chunks_tbl.delete(f"doc_id == '{payload.doc_id}'")
+    return {"status": "deleted", "doc_id": payload.doc_id}
+
+
+@app.post("/erase")
+def erase_database(payload: EraseDatabasePayload):
+    if payload.confirm != "ERASE":
+        raise HTTPException(status_code=400, detail="Confirmation mismatch")
+    conn = get_db()
+    if "documents" in conn.table_names():
+        conn.drop_table("documents")
+    if "chunks" in conn.table_names():
+        conn.drop_table("chunks")
+    return {"status": "erased"}
 
 
 # ---------------------------
