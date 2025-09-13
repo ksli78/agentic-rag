@@ -1,45 +1,25 @@
 # -*- coding: utf-8 -*-
 """
-ADAM FastAPI - Ingestion + Query (PDF -> Marker Markdown -> heading-aware chunking -> embeddings)
+ADAM FastAPI - Ingestion + Query
 
-What changed vs your previous version:
-- We now convert PDFs to Markdown using the Marker library BEFORE chunking.
-- Marker can optionally use a local LLM via Ollama to improve formatting (tables, math, layout).
-- Chunking is heading/paragraph aware to keep semantic boundaries, then we add overlap.
-- We kept LanceDB, Ollama embeddings, and your existing endpoints intact.
-
-Notes:
-- Embedding dim stays 768 (EmbeddingGemma) to match LanceDB schema.
-- If Marker fails (bad install, model download), we gracefully fall back to PyPDF text.
+PDF -> text via PyPDF -> char-based chunking -> embeddings
 """
 
 import io
 import os
-import re
 import hashlib
-import tempfile
 from datetime import datetime
 from typing import List, Optional, Dict, Any, Tuple
 
 import httpx
-import numpy as np
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from pydantic import BaseModel, Field
-from pypdf import PdfReader
 
 import lancedb
 from lancedb import LanceDBConnection
 from lancedb.pydantic import LanceModel, Vector
 
 import ollama  # python client for Ollama
-
-# ---- Marker imports (installed via requirements) ----
-# We import lazily-friendly modules here; if torch/marker aren't present,
-# we'll catch exceptions and fall back to simple PyPDF text extraction.
-from marker.converters.pdf import PdfConverter  # type: ignore
-from marker.models import create_model_dict  # type: ignore
-from marker.output import text_from_rendered  # type: ignore
-from marker.config.parser import ConfigParser  # type: ignore
 
 # ---------------------------
 # Environment / Config
@@ -52,19 +32,9 @@ GEN_MODEL = os.getenv("OLLAMA_GEN_MODEL", "llama3.2:latest")
 # Vector DB
 LANCEDB_URI = os.getenv("LANCEDB_URI", "/data/lancedb")
 
-# Chunking knobs (characters, not tokens, but works well with Markdown)
+# Chunking knobs (characters)
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1200"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))
-
-# Marker knobs (override via env if needed)
-USE_MARKER = os.getenv("USE_MARKER", "true").lower() in ("1", "true", "yes")
-MARKER_USE_LLM = os.getenv("MARKER_USE_LLM", "true").lower() in ("1", "true", "yes")
-MARKER_OLLAMA_MODEL = os.getenv("MARKER_OLLAMA_MODEL", "llama3:8b")
-MARKER_FORCE_OCR = os.getenv("MARKER_FORCE_OCR", "false").lower() in ("1", "true", "yes")
-MARKER_STRIP_OCR = os.getenv("MARKER_STRIP_OCR", "false").lower() in ("1", "true", "yes")
-MARKER_DEBUG = os.getenv("MARKER_DEBUG", "false").lower() in ("1", "true", "yes")
-# Device hint for Marker models ("cuda", "cuda:0", "cpu"). If unset, we auto-detect.
-MARKER_DEVICE = os.getenv("MARKER_DEVICE", "").strip()
 
 # Ollama client
 client = ollama.Client(host=OLLAMA_HOST)
@@ -124,154 +94,27 @@ def sha256_bytes(data: bytes) -> str:
     return h.hexdigest()
 
 
-def pdf_page_count(pdf_bytes: bytes) -> int:
-    """Get page count quickly with PyPDF (cheap even if we use Marker)."""
+def extract_pdf_text_and_pages(pdf_bytes: bytes) -> Tuple[str, int]:
+    from pypdf import PdfReader
     reader = PdfReader(io.BytesIO(pdf_bytes))
-    return len(reader.pages)
+    texts: List[str] = []
+    for page in reader.pages:
+        try:
+            texts.append(page.extract_text() or "")
+        except Exception:
+            texts.append("")
+    return "\n\n".join(texts), len(reader.pages)
 
 
-# ---------------------------
-# Marker conversion
-# ---------------------------
-
-def _detect_device() -> str:
-    """
-    Decide which device to use for Marker models.
-    - Respect MARKER_DEVICE if provided (e.g., 'cuda', 'cuda:0', or 'cpu').
-    - Else attempt to use CUDA if available; otherwise CPU.
-    We avoid importing torch at module import to keep failure modes clean.
-    """
-    if MARKER_DEVICE:
-        return MARKER_DEVICE
-    try:
-        import torch  # type: ignore
-        return "cuda" if torch.cuda.is_available() else "cpu"
-    except Exception:
-        return "cpu"
-
-
-def pdf_to_markdown_with_marker(pdf_bytes: bytes) -> str:
-    """
-    Convert PDF -> Markdown via Marker.
-    If anything goes wrong, raise (caller will decide to fall back).
-    """
-    # Write to a temp file because Marker APIs expect file paths.
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=True) as tmp:
-        tmp.write(pdf_bytes)
-        tmp.flush()
-
-        # Build a Marker config that uses Ollama when LLM is enabled.
-        config: Dict[str, Any] = {
-            "output_format": "markdown",
-            "use_llm": MARKER_USE_LLM,
-            "debug": MARKER_DEBUG,
-            "force_ocr": MARKER_FORCE_OCR,
-            "strip_existing_ocr": MARKER_STRIP_OCR,
-            "disable_image_extraction": True,  # we only need text
-        }
-        if MARKER_USE_LLM:
-            # Tell Marker to use the local Ollama service + which model
-            # (these keys are documented; see README and issues).
-            config.update({
-                "llm_service": "marker.services.ollama.OllamaService",
-                "ollama_base_url": OLLAMA_HOST,
-                "ollama_model": MARKER_OLLAMA_MODEL,
-            })
-
-        config_parser = ConfigParser(config)
-        # Choose device for Marker models (layout/ocr/etc.)
-        device = _detect_device()
-        artifact_dict = create_model_dict(device=device)
-
-        # Build the converter and run it
-        converter = PdfConverter(
-            artifact_dict=artifact_dict,
-            config=config_parser.generate_config_dict(),
-            processor_list=config_parser.get_processors(),
-            renderer=config_parser.get_renderer(),
-            llm_service=config_parser.get_llm_service(),
-        )
-        rendered = converter(tmp.name)
-        # text_from_rendered returns (text, metadata, images) for markdown output
-        md_text, _, _ = text_from_rendered(rendered)
-        return md_text or ""
-
-
-# ---------------------------
-# Markdown-aware chunking
-# ---------------------------
-
-_MD_CODE_FENCE = re.compile(r"^```", re.MULTILINE)
-_MD_HEADER = re.compile(r"^#{1,6}\s+.*$", re.MULTILINE)
-
-
-def _split_markdown_paragraphs(md: str) -> List[str]:
-    """
-    Split Markdown into logical paragraphs while respecting fenced code blocks.
-    We keep code/table blocks intact, and only split on blank lines outside code.
-    """
-    lines = md.splitlines()
-    paras: List[str] = []
-    buf: List[str] = []
-    in_code = False
-
-    for line in lines:
-        if line.strip().startswith("```"):
-            in_code = not in_code
-            buf.append(line)
-            continue
-
-        if not in_code and line.strip() == "":
-            if buf:
-                paras.append("\n".join(buf).strip())
-                buf = []
-        else:
-            buf.append(line)
-
-    if buf:
-        paras.append("\n".join(buf).strip())
-    return [p for p in paras if p]
-
-
-def chunk_markdown(md: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[Tuple[int, int, str]]:
-    """
-    Greedy pack paragraphs into ~size char chunks with ~overlap chars carried over.
-    We use (page_start, page_end) placeholders = (1,1) since we don't map pages.
-    """
-    paras = _split_markdown_paragraphs(md)
+def chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[Tuple[int, int, str]]:
+    start, n = 0, len(text)
     chunks: List[Tuple[int, int, str]] = []
-    cur: List[str] = []
-    cur_len = 0
-
-    for p in paras:
-        p_len = len(p) + 2  # account for spacing
-        if cur and cur_len + p_len > size:
-            chunk_text = "\n\n".join(cur).strip()
-            if chunk_text:
-                chunks.append((1, 1, chunk_text))
-
-            # Build overlap by prepending trailing paragraphs whose cumulative
-            # length is <= overlap
-            carry: List[str] = []
-            carry_len = 0
-            for rp in reversed(cur):
-                rp_len = len(rp) + 2
-                if carry_len + rp_len > overlap:
-                    break
-                carry.insert(0, rp)
-                carry_len += rp_len
-
-            cur = carry + [p]
-            cur_len = sum(len(x) + 2 for x in cur)
-        else:
-            cur.append(p)
-            cur_len += p_len
-
-    if cur:
-        chunk_text = "\n\n".join(cur).strip()
-        if chunk_text:
-            chunks.append((1, 1, chunk_text))
-
+    while start < n:
+        end = min(n, start + size)
+        chunks.append((1, 1, text[start:end]))
+        if end == n:
+            break
+        start = max(0, end - overlap)
     return chunks
 
 
@@ -414,7 +257,7 @@ def ingest_text(payload: IngestText):
     chunks_tbl.delete(f"doc_id == '{doc_id}'")
 
     # chunk and embed
-    ch = chunk_markdown(text, CHUNK_SIZE, CHUNK_OVERLAP)
+    ch = chunk_text(text, CHUNK_SIZE, CHUNK_OVERLAP)
     texts = [c[2] for c in ch]
     vecs = embed_texts(texts)
 
@@ -494,28 +337,11 @@ def _ingest_common(
         raise HTTPException(status_code=400, detail="Empty file")
 
     # Compute metadata first
-    pcount = pdf_page_count(pdf_bytes)
+    text, pcount = extract_pdf_text_and_pages(pdf_bytes)
     sha = sha256_bytes(pdf_bytes)
     # Stable id: prefer caller's doc_id, else hash of URL (or file hash)
     base_for_id = (source_url or sha)[:64]
     doc_id = doc_id or hashlib.sha1(base_for_id.encode("utf-8")).hexdigest()
-
-    # Convert to Markdown with Marker (preferred), else fall back to PyPDF text
-    try:
-        if USE_MARKER:
-            md_text = pdf_to_markdown_with_marker(pdf_bytes)
-        else:
-            raise RuntimeError("USE_MARKER disabled")  # jump to fallback
-    except Exception:
-        # Fallback: basic text extraction via PyPDF (no layout fixes)
-        reader = PdfReader(io.BytesIO(pdf_bytes))
-        pages = []
-        for page in reader.pages:
-            try:
-                pages.append(page.extract_text() or "")
-            except Exception:
-                pages.append("")
-        md_text = "\n\n".join(pages)
 
     conn = get_db()
     docs, chunks_tbl = get_or_create_tables(conn)
@@ -529,14 +355,14 @@ def _ingest_common(
     chunks_tbl.delete(f"doc_id == '{doc_id}'")
 
     # chunk + embed
-    ch = chunk_markdown(md_text, CHUNK_SIZE, CHUNK_OVERLAP)
-    texts = [c[2] for c in ch] if ch else [md_text]
+    ch = chunk_text(text, CHUNK_SIZE, CHUNK_OVERLAP)
+    texts = [c[2] for c in ch] if ch else [text]
     vecs = embed_texts(texts)
 
     rows = []
     # If chunking yielded nothing (empty doc), bail gracefully
     if not ch:
-        ch = [(1, 1, md_text)]
+        ch = [(1, 1, text)]
 
     for (pgs, pge, t), v in zip(ch, vecs):
         rows.append({
@@ -552,15 +378,17 @@ def _ingest_common(
 
     # upsert document metadata
     docs.delete(f"doc_id == '{doc_id}'")
-    docs.add([{ 
-        "doc_id": doc_id,
-        "source_url": source_url,
-        "title": title,
-        "sha256": sha,
-        "etag": etag,
-        "last_modified": last_modified,
-        "page_count": pcount,
-        "ingested_at": datetime.utcnow().isoformat() + "Z"
-    }])
+    docs.add([
+        {
+            "doc_id": doc_id,
+            "source_url": source_url,
+            "title": title,
+            "sha256": sha,
+            "etag": etag,
+            "last_modified": last_modified,
+            "page_count": pcount,
+            "ingested_at": datetime.utcnow().isoformat() + "Z",
+        }
+    ])
 
     return {"status": "ok", "doc_id": doc_id, "chunks": len(rows)}
