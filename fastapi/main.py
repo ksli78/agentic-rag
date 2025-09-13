@@ -334,7 +334,9 @@ def query(payload: QueryPayload):
 def list_documents():
     conn = get_db()
     docs, _ = get_or_create_tables(conn)
-    return {"documents": docs.to_list()}
+    # LanceTable lacks a direct to_list method; use a search query
+    # without filters to retrieve all rows instead.
+    return {"documents": list(docs.search().to_list())}
 
 
 @app.get("/document/{doc_id}")
