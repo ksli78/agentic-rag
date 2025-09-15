@@ -25,7 +25,8 @@ import tempfile
 import json
 import re
 
-
+from langchain.embeddings import OllamaEmbeddings
+from langchain.vectorstores import FAISS
 from langchain_docling import DoclingLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
@@ -39,6 +40,11 @@ GEN_MODEL = os.getenv("OLLAMA_GEN_MODEL", "llama3.2:latest")
 
 # Vector DB
 LANCEDB_URI = os.getenv("LANCEDB_URI", "/data/lancedb")
+# Path on the Docker volume where the FAISS index will be stored
+FAISS_INDEX_PATH = os.getenv("FAISS_INDEX_PATH", "/data/faiss_index")
+
+# Create an embeddings object once; OllamaEmbeddings wraps the same model you’re using
+embedder = OllamaEmbeddings(model=EMBED_MODEL, base_url=OLLAMA_HOST)
 
 # Chunking knobs (characters)
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1200"))
@@ -205,6 +211,14 @@ def determine_question_category(question: str) -> Optional[str]:
             return w
     return None
 
+def get_faiss_index() -> Optional[FAISS]:
+    """
+    Load the FAISS index from disk if it exists; return None if not.
+    """
+    if os.path.exists(FAISS_INDEX_PATH):
+        # allow_dangerous_deserialization=True is required by LangChain to unpickle FAISS indexes
+        return FAISS.load_local(FAISS_INDEX_PATH, embedder, allow_dangerous_deserialization=True)
+    return None
 
 # ---------------------------
 # Embeddings / Generation
@@ -524,140 +538,94 @@ def ingest_text(payload: IngestText):
 # -----------------------------------------
 # Query Endpoint with category + keyword logic
 # -----------------------------------------
-
 @app.post("/query")
 def query(payload: QueryPayload):
     """
-    Enhanced query endpoint with lexical fallback.
-    - Tokenizes the question.
-    - If any document's title or keywords contain a token, returns those docs' chunks directly.
-    - Otherwise runs semantic search with category/keyword re-ranking.
-    - Citations include doc_id, title, source_url, and page range.
+    Query the FAISS index and return an answer with citations.
+    Uses lexical match, keyword match, and category match to boost results.
     """
     question = payload.question or ""
     top_k = payload.top_k
     if not question.strip():
         raise HTTPException(status_code=400, detail="Empty question")
 
-    conn = get_db()
-    docs, chunks_tbl = get_or_create_tables(conn)
+    # Load FAISS index
+    index = get_faiss_index()
+    if index is None:
+        raise HTTPException(status_code=500, detail="No FAISS index found")
 
-    # Load all documents into a dict
-    all_docs = docs.search().to_list()
+    # Fetch document metadata
+    conn = get_db()
+    docs_tbl, _ = get_or_create_tables(conn)
+    all_docs = docs_tbl.search().to_list()
     doc_map = {d["doc_id"]: d for d in all_docs}
 
-    # Tokenize the question
+    # Tokenize question
     tokens = [tok for tok in re.findall(r"[a-zA-Z0-9']+", question.lower()) if tok]
 
-    # Lexical fallback: find docs whose title or keywords contain any token
-    matched_docs = []
-    for d in all_docs:
-        title_l = (d.get("title") or "").lower()
-        kws_l = [kw.lower() for kw in (d.get("keywords") or [])]
-        if any(tok in title_l for tok in tokens) or any(tok in kws_l for tok in tokens):
-            matched_docs.append(d)
-
-    # If lexical matches exist, return those documents' chunks
-    if matched_docs:
-        contexts = []
-        # Limit to top_k documents to keep the response concise
-        for doc in matched_docs[:top_k]:
-            doc_id = doc["doc_id"]
-            # Fetch the first chunk for the matched doc
-            chunks = chunks_tbl.search().where(f"doc_id == '{doc_id}'").limit(1).to_list()
-            if chunks:
-                ch = chunks[0]
-                contexts.append({
-                    "doc_id": doc_id,
-                    "page_start": int(ch.get("page_start", 1)),
-                    "page_end": int(ch.get("page_end", 1)),
-                    "text": ch["text"]
-                })
-
-        # If we have contexts, build answer and citations
-        if contexts:
-            answer = answer_with_context(question, contexts)
-            citations = []
-            for c in contexts:
-                meta = doc_map.get(c["doc_id"], {})
-                citations.append({
-                    "doc_id": c["doc_id"],
-                    "title": meta.get("title"),
-                    "source_url": meta.get("source_url"),
-                    "page_start": c["page_start"],
-                    "page_end": c["page_end"],
-                })
-            return {"answer": answer, "citations": citations}
-
-    # -----------------------------------------------------------
-    # No lexical matches; fall back to semantic search + re-ranking
-    # -----------------------------------------------------------
-
-    # Determine question category via heuristic/LLM
+    # Determine question category
     category = determine_question_category(question)
 
-    # Get vector for question
-    qvec = embed_texts([question])[0]
+    # Run similarity search in FAISS
+    retrieved = index.similarity_search(question, k=top_k * 5)
 
-    # Candidate generation via semantic search
-    vector_hits = chunks_tbl.search(qvec).limit(top_k * 5).to_list()
-
-    # Also gather docs that share any keyword with the question
-    keyword_docs = set()
-    for d in all_docs:
-        kws_l = [kw.lower() for kw in (d.get("keywords") or [])]
-        if any(tok in kws_l for tok in tokens):
-            keyword_docs.add(d["doc_id"])
-
-    # Add up to two chunks from each keyword-matched doc
-    keyword_hits = []
-    for doc_id in keyword_docs:
-        keyword_hits.extend(chunks_tbl.search().where(f"doc_id == '{doc_id}'").limit(2).to_list())
-
-    # Combine and re-rank
-    all_hits = vector_hits + keyword_hits
-    if not all_hits:
+    if not retrieved:
         return {"answer": "I couldn't find relevant content.", "citations": []}
 
+    # Identify docs whose keywords intersect with question tokens
+    keyword_docs = set()
+    for d in all_docs:
+        kws = [kw.lower() for kw in (d.get("keywords") or [])]
+        if any(tok in kws for tok in tokens):
+            keyword_docs.add(d["doc_id"])
+
+    # Rank results by lexical match, keyword match, and category
     candidates = []
-    for idx, hit in enumerate(all_hits):
-        doc_id = hit["doc_id"]
-        meta = doc_map.get(doc_id, {})
-        # Keyword score: high if doc_id is in keyword_docs; else count overlapping keywords
-        kw_score = 10 if doc_id in keyword_docs else sum(
-            1 for kw in (meta.get("keywords") or []) if kw.lower() in question.lower()
-        )
-        cat_score = 1 if category and meta.get("category") == category else 0
-        candidates.append((hit, kw_score, cat_score, idx))
+    for idx, doc in enumerate(retrieved):
+        meta = doc.metadata or {}
+        text_lower = doc.page_content.lower()
+        lex_match = 1 if any(tok in text_lower for tok in tokens) else 0
+        doc_id = meta.get("doc_id")
+        # Keyword score
+        if doc_id in keyword_docs:
+            kw_score = 10
+        else:
+            kws = [kw.lower() for kw in (doc_map.get(doc_id, {}).get("keywords") or [])]
+            kw_score = sum(1 for kw in kws if kw in question.lower())
+        # Category match
+        cat_score = 1 if category and doc_map.get(doc_id, {}).get("category") == category else 0
+        candidates.append((doc, lex_match, kw_score, cat_score, idx))
 
-    candidates.sort(key=lambda t: (-t[1], -t[2], t[3]))
-    top_hits = [h for h, _, _, _ in candidates[:top_k]]
+    candidates.sort(key=lambda x: (-x[1], -x[2], -x[3], x[4]))
+    top_docs = [d for d, _, _, _, _ in candidates[:top_k]]
 
-    # Build contexts and answer
+    # Build contexts
     contexts = []
-    for h in top_hits:
+    for d in top_docs:
+        meta = d.metadata or {}
         contexts.append({
-            "doc_id": h["doc_id"],
-            "page_start": int(h.get("page_start", 1)),
-            "page_end": int(h.get("page_end", 1)),
-            "text": h["text"]
+            "doc_id": meta.get("doc_id"),
+            "page_start": meta.get("page_start", 1),
+            "page_end": meta.get("page_end", 1),
+            "text": d.page_content
         })
+
+    # Generate answer
     answer = answer_with_context(question, contexts)
 
-    # Build citations with title and URL
+    # Build citations
     citations = []
-    for c in contexts:
-        meta = doc_map.get(c["doc_id"], {})
+    for ctx in contexts:
+        meta = doc_map.get(ctx["doc_id"], {})
         citations.append({
-            "doc_id": c["doc_id"],
+            "doc_id": ctx["doc_id"],
             "title": meta.get("title"),
             "source_url": meta.get("source_url"),
-            "page_start": c["page_start"],
-            "page_end": c["page_end"],
+            "page_start": ctx["page_start"],
+            "page_end": ctx["page_end"],
         })
 
     return {"answer": answer, "citations": citations}
-
 
 @app.get("/documents")
 def list_documents():
@@ -715,14 +683,18 @@ def _ingest_common(
     title: Optional[str]
 ):
     """
-    Ingest a PDF using Docling + LangChain.  Parses the PDF with DoclingLoader,
-    cleans out banner/CUI/copyright lines, splits into chunks, embeds them,
-    uses an LLM to extract category and keywords, and stores everything in LanceDB.
+    Ingest a PDF into a FAISS index.
+    - Parses the PDF with DoclingLoader.
+    - Cleans proprietary/CUI notices from each page.
+    - Splits into overlapping chunks.
+    - Embeds each chunk using OllamaEmbeddings.
+    - Adds the vectors and metadata to a FAISS index stored on disk.
+    - Populates the documents table with high-level metadata, category and keywords.
     """
     if not pdf_bytes:
         raise HTTPException(status_code=400, detail="Empty file")
 
-    # Write PDF bytes to a temporary file for DoclingLoader
+    # Save PDF to temp file for Docling
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(pdf_bytes)
         tmp_path = tmp.name
@@ -736,29 +708,18 @@ def _ingest_common(
     if not documents:
         raise HTTPException(status_code=400, detail="Unable to parse PDF")
 
-    # Remove noise from each page's content
+    # Clean each page’s content
     for doc in documents:
         doc.page_content = remove_noise(doc.page_content)
 
-    # Compute SHA of the raw PDF for deduplication
+    # Compute SHA of original PDF
     sha = sha256_bytes(pdf_bytes)
 
     # Derive stable doc_id
     base_for_id = (source_url or sha)[:64]
     doc_id = doc_id or hashlib.sha1(base_for_id.encode("utf-8")).hexdigest()
 
-    conn = get_db()
-    docs_tbl, chunks_tbl = get_or_create_tables(conn)
-
-    # Skip if unchanged
-    existing = list(docs_tbl.search().where(f"doc_id == '{doc_id}'").to_list())
-    if existing and existing[0]["sha256"] == sha:
-        return {"status": "skipped", "reason": "unchanged", "doc_id": doc_id}
-
-    # Delete old chunks
-    chunks_tbl.delete(f"doc_id == '{doc_id}'")
-
-    # Split using LangChain's text splitter
+    # Prepare split documents
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
@@ -766,36 +727,42 @@ def _ingest_common(
     )
     split_docs = splitter.split_documents(documents)
 
-    # Prepare texts and embeddings
-    texts = [d.page_content for d in split_docs]
-    embeddings = embed_texts(texts)
+    if not split_docs:
+        raise HTTPException(status_code=400, detail="No text extracted")
 
-    rows = []
-    for doc_obj, vec in zip(split_docs, embeddings):
+    # Texts and metadata for FAISS
+    texts = []
+    metas = []
+    for doc_obj in split_docs:
         meta = doc_obj.metadata or {}
-        page_start = int(meta.get("page", 1))
-        page_end = page_start
-        content = doc_obj.page_content
-        rows.append({
+        p_start = int(meta.get("page", 1))
+        p_end = p_start
+        texts.append(doc_obj.page_content)
+        metas.append({
             "doc_id": doc_id,
-            "chunk_id": hashlib.sha1((doc_id + content[:64]).encode("utf-8")).hexdigest(),
-            "page_start": page_start,
-            "page_end": page_end,
-            "text": content,
-            "embedding": vec
+            "page_start": p_start,
+            "page_end": p_end,
+            "title": title,
+            "source_url": source_url,
         })
 
-    if rows:
-        chunks_tbl.add(rows)
+    # Load or create the FAISS index and add new vectors
+    index = get_faiss_index()
+    if index is None:
+        index = FAISS.from_texts(texts, embedder, metadatas=metas)
+    else:
+        index.add_texts(texts, metadatas=metas)
+    # Persist to disk
+    index.save_local(FAISS_INDEX_PATH)
 
-    # Use the full cleaned text to extract category and keywords
+    # Extract category and keywords using the LLM
     full_text = "\n\n".join([d.page_content for d in documents])
     category, keywords = extract_extra_metadata(full_text)
 
-    # Page count equals number of original Docling Documents
+    # Document-level metadata stored in the existing LanceDB "documents" table
+    conn = get_db()
+    docs_tbl, _ = get_or_create_tables(conn)
     page_count = len(documents)
-
-    # Upsert document metadata
     docs_tbl.delete(f"doc_id == '{doc_id}'")
     docs_tbl.add([{
         "doc_id": doc_id,
@@ -807,7 +774,7 @@ def _ingest_common(
         "page_count": page_count,
         "ingested_at": datetime.utcnow().isoformat() + "Z",
         "category": category,
-        "keywords": keywords
+        "keywords": keywords,
     }])
 
-    return {"status": "ok", "doc_id": doc_id, "chunks": len(rows)}
+    return {"status": "ok", "doc_id": doc_id, "chunks": len(texts)}

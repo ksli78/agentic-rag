@@ -39,6 +39,7 @@ services:
       - OLLAMA_EMBED_MODEL=embeddinggemma:latest
       - OLLAMA_GEN_MODEL=llama3.2:latest
       - LANCEDB_URI=/data/lancedb
+      - FAISS_INDEX_PATH=/data/faiss_index
       - CHUNK_SIZE=1200
       - CHUNK_OVERLAP=200
       # Optional Marker+Ollama settings
@@ -48,6 +49,7 @@ services:
       - MARKER_DEVICE=cuda
     volumes:
       - lancedb:/data/lancedb
+      - faiss_index:/data/faiss_index   # <- new volume for FAISS
     ports:
       - "8000:8000"
 
