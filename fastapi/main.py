@@ -604,25 +604,37 @@ def query(payload: QueryPayload):
     top_docs = [d for d, _, _, _, _ in candidates[:top_k]]
 
     # Build contexts
-    contexts = []
-    for d in top_docs:
-        meta = d.metadata or {}
-        contexts.append({
-            "doc_id": meta.get("doc_id"),
-            "page_start": meta.get("page_start", 1),
-            "page_end": meta.get("page_end", 1),
-            "text": d.page_content
+    unique_contexts = []
+    seen_ids = set()
+    for doc, _, _, _, _ in candidates:
+        doc_id = doc.metadata.get("doc_id")
+        if doc_id in seen_ids:
+            continue
+        seen_ids.add(doc_id)
+        unique_contexts.append({
+            "doc_id": doc_id,
+            "page_start": doc.metadata.get("page_start", 1),
+            "page_end": doc.metadata.get("page_end", 1),
+            "text": doc.page_content,
         })
+        if len(unique_contexts) == top_k:
+            break
+        
 
     # Generate answer
-    answer = answer_with_context(question, contexts)
+    answer = answer_with_context(question, unique_contexts)
 
-    # Build citations
+    # Build citations with title and source_url, removing duplicates
     citations = []
-    for ctx in contexts:
-        meta = doc_map.get(ctx["doc_id"], {})
+    seen_docs = set()
+    for ctx in unique_contexts:
+        doc_id = ctx["doc_id"]
+        if doc_id in seen_docs:
+            continue
+        seen_docs.add(doc_id)
+        meta = doc_map.get(doc_id, {})
         citations.append({
-            "doc_id": ctx["doc_id"],
+            "doc_id": doc_id,
             "title": meta.get("title"),
             "source_url": meta.get("source_url"),
             "page_start": ctx["page_start"],
@@ -750,7 +762,7 @@ def _ingest_common(
             "source_url": source_url,
         })
 
-    # Load or create the FAISS index and add new vectors
+     # Load or create the FAISS index and add new vectors
     index = get_faiss_index()
     if index is None:
         index = FAISS.from_texts(texts, embedder, metadatas=metas)
@@ -759,13 +771,36 @@ def _ingest_common(
     # Persist to disk
     index.save_local(FAISS_INDEX_PATH)
 
+    # Compute embeddings for storing in LanceDB (reuse the same embedder)
+    vecs = embedder.embed_documents(texts)
+
+    # Store each chunk into the chunks table
+    conn = get_db()
+    docs_tbl, chunks_tbl = get_or_create_tables(conn)
+    # Remove old chunks for this doc_id
+    chunks_tbl.delete(f"doc_id == '{doc_id}'")
+    chunk_rows = []
+    for doc_obj, vec in zip(split_docs, vecs):
+        meta = doc_obj.metadata or {}
+        p_start = int(meta.get("page", 1))
+        p_end = p_start
+        content = doc_obj.page_content
+        chunk_rows.append({
+            "doc_id": doc_id,
+            "chunk_id": hashlib.sha1((doc_id + content[:64]).encode("utf-8")).hexdigest(),
+            "page_start": p_start,
+            "page_end": p_end,
+            "text": content,
+            "embedding": vec
+        })
+    if chunk_rows:
+        chunks_tbl.add(chunk_rows)
+
     # Extract category and keywords using the LLM
     full_text = "\n\n".join([d.page_content for d in documents])
     category, keywords = extract_extra_metadata(full_text)
 
     # Document-level metadata stored in the existing LanceDB "documents" table
-    conn = get_db()
-    docs_tbl, _ = get_or_create_tables(conn)
     page_count = len(documents)
     docs_tbl.delete(f"doc_id == '{doc_id}'")
     docs_tbl.add([{

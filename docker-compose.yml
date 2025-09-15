@@ -36,7 +36,7 @@ services:
             - capabilities: ["gpu"]
     environment:
       - OLLAMA_HOST=http://ollama:11434
-      - OLLAMA_EMBED_MODEL=embeddinggemma:latest
+      - OLLAMA_EMBED_MODEL=sentence-transformers/all-mpnet-base-v2  # <= update this line
       - OLLAMA_GEN_MODEL=llama3.2:latest
       - LANCEDB_URI=/data/lancedb
       - FAISS_INDEX_PATH=/data/faiss_index
