@@ -44,8 +44,8 @@ LANCEDB_URI = os.getenv("LANCEDB_URI", "/data/lancedb")
 # Path on the Docker volume where the FAISS index will be stored
 FAISS_INDEX_PATH = os.getenv("FAISS_INDEX_PATH", "/data/faiss_index")
 
-# Create an embeddings object once; OllamaEmbeddings wraps the same model you’re using
-embedder = HuggingFaceEmbeddings(model=EMBED_MODEL, base_url=OLLAMA_HOST)
+
+embedder = HuggingFaceEmbeddings(model=EMBED_MODEL)
 
 # Chunking knobs (characters)
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1200"))
