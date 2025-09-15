@@ -25,17 +25,18 @@ import tempfile
 import json
 import re
 
-from langchain.embeddings import OllamaEmbeddings
+# from langchain.embeddings import OllamaEmbeddings
 from langchain.vectorstores import FAISS
 from langchain_docling import DoclingLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.embeddings import HuggingFaceEmbeddings
 
 # ---------------------------
 # Environment / Config
 # ---------------------------
 # Ollama (same as before)
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://ollama:11434")
-EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "embeddinggemma:latest")
+EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL","sentence-transformers/all-mpnet-base-v2")
 GEN_MODEL = os.getenv("OLLAMA_GEN_MODEL", "llama3.2:latest")
 
 # Vector DB
@@ -44,7 +45,7 @@ LANCEDB_URI = os.getenv("LANCEDB_URI", "/data/lancedb")
 FAISS_INDEX_PATH = os.getenv("FAISS_INDEX_PATH", "/data/faiss_index")
 
 # Create an embeddings object once; OllamaEmbeddings wraps the same model you’re using
-embedder = OllamaEmbeddings(model=EMBED_MODEL, base_url=OLLAMA_HOST)
+embedder = HuggingFaceEmbeddings(model=EMBED_MODEL, base_url=OLLAMA_HOST)
 
 # Chunking knobs (characters)
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1200"))
@@ -216,10 +217,13 @@ def get_faiss_index() -> Optional[FAISS]:
     Load the FAISS index from disk if it exists; return None if not.
     """
     if os.path.exists(FAISS_INDEX_PATH):
-        # allow_dangerous_deserialization=True is required by LangChain to unpickle FAISS indexes
-        return FAISS.load_local(FAISS_INDEX_PATH, embedder, allow_dangerous_deserialization=True)
+        # embedder is now your HuggingFaceEmbeddings instance
+        return FAISS.load_local(
+            FAISS_INDEX_PATH,
+            embedder,
+            allow_dangerous_deserialization=True
+        )
     return None
-
 # ---------------------------
 # Embeddings / Generation
 # ---------------------------

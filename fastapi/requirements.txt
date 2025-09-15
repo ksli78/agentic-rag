@@ -12,3 +12,7 @@ langchain>=0.1.0
 langchain-docling>=0.1.0
 langchain-community>=0.0.8
 faiss-cpu>=1.7.4
+# For using a local MPNet/MiniLM model with LangChain
+sentence-transformers>=0.5.1
+transformers>=4.34.0
+torch>=2.0.0
