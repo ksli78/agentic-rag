@@ -45,7 +45,7 @@ LANCEDB_URI = os.getenv("LANCEDB_URI", "/data/lancedb")
 FAISS_INDEX_PATH = os.getenv("FAISS_INDEX_PATH", "/data/faiss_index")
 
 
-embedder = HuggingFaceEmbeddings(model=EMBED_MODEL)
+embedder = HuggingFaceEmbeddings(model_name=EMBED_MODEL)
 
 # Chunking knobs (characters)
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1200"))
