@@ -47,6 +47,7 @@ services:
       - MARKER_USE_LLM=true
       - MARKER_OLLAMA_MODEL=llama3:8b
       - MARKER_DEVICE=cuda
+      - OVER_SAMPLE=10
     volumes:
       - lancedb:/data/lancedb
       - faiss_index:/data/faiss_index   # <- new volume for FAISS

@@ -16,3 +16,5 @@ faiss-cpu>=1.7.4
 sentence-transformers>=0.5.1
 transformers>=4.34.0
 torch>=2.0.0
+llama-index>=0.10.0
+llama-index-embeddings-langchain>=0.1.0

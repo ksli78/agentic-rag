@@ -25,11 +25,19 @@ import tempfile
 import json
 import re
 
-# from langchain.embeddings import OllamaEmbeddings
-from langchain.vectorstores import FAISS
+
+
 from langchain_docling import DoclingLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.embeddings import HuggingFaceEmbeddings
+from llama_index.core import (
+    ServiceContext,
+    Document as LlamaDocument,
+    VectorStoreIndex,
+    StorageContext,
+    load_index_from_storage,
+)
+from llama_index.embeddings.langchain import LangchainEmbedding
 
 # ---------------------------
 # Environment / Config
@@ -38,14 +46,16 @@ from langchain.embeddings import HuggingFaceEmbeddings
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://ollama:11434")
 EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL","sentence-transformers/all-mpnet-base-v2")
 GEN_MODEL = os.getenv("OLLAMA_GEN_MODEL", "llama3.2:latest")
-
+OVER_SAMPLE = os.getenv("OVER_SAMPLE", 10)
 # Vector DB
 LANCEDB_URI = os.getenv("LANCEDB_URI", "/data/lancedb")
-# Path on the Docker volume where the FAISS index will be stored
-FAISS_INDEX_PATH = os.getenv("FAISS_INDEX_PATH", "/data/faiss_index")
 
+LLAMA_INDEX_PATH = os.getenv("LLAMA_INDEX_PATH", "/data/llama_index")
 
 embedder = HuggingFaceEmbeddings(model_name=EMBED_MODEL)
+# Build a LlamaIndex-compatible embed model from our LangChain embedder
+llama_embed_model = LangchainEmbedding(embedder)
+service_context = ServiceContext.from_defaults( llm=None, embed_model=llama_embed_model)
 
 # Chunking knobs (characters)
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1200"))
@@ -131,6 +141,15 @@ def get_or_create_tables(conn: LanceDBConnection):
 # ---------------------------
 # Utility helpers
 # ---------------------------
+def load_llama_index() -> Optional[VectorStoreIndex]:
+    """
+    Load the LlamaIndex vector index from disk, or return None if it doesn't exist.
+    """
+    if os.path.exists(LLAMA_INDEX_PATH):
+        storage_context = StorageContext.from_defaults(persist_dir=LLAMA_INDEX_PATH)
+        return load_index_from_storage(storage_context, service_context=service_context)
+    return None
+
 def remove_noise(text: str) -> str:
     """
     Remove lines that start with known noise phrases or match noise patterns.
@@ -212,18 +231,7 @@ def determine_question_category(question: str) -> Optional[str]:
             return w
     return None
 
-def get_faiss_index() -> Optional[FAISS]:
-    """
-    Load the FAISS index from disk if it exists; return None if not.
-    """
-    if os.path.exists(FAISS_INDEX_PATH):
-        # embedder is now your HuggingFaceEmbeddings instance
-        return FAISS.load_local(
-            FAISS_INDEX_PATH,
-            embedder,
-            allow_dangerous_deserialization=True
-        )
-    return None
+
 # ---------------------------
 # Embeddings / Generation
 # ---------------------------
@@ -445,7 +453,6 @@ def ingest_json(payload: IngestJsonPayload):
 
     return {"status": "ok", "doc_id": doc_id, "chunks": len(rows), "category": category, "keywords": keywords}
 
-
 @app.post("/ingest/url")
 async def ingest_url(payload: IngestUrl):
     async with httpx.AsyncClient(follow_redirects=True, timeout=60) as s:
@@ -461,7 +468,6 @@ async def ingest_url(payload: IngestUrl):
         last_modified=payload.last_modified,
         title=payload.title
     )
-
 
 @app.post("/ingest/upload")
 async def ingest_upload(
@@ -481,7 +487,6 @@ async def ingest_upload(
         last_modified=last_modified,
         title=title or file.filename
     )
-
 
 @app.post("/ingest/text")
 def ingest_text(payload: IngestText):
@@ -545,7 +550,7 @@ def ingest_text(payload: IngestText):
 @app.post("/query")
 def query(payload: QueryPayload):
     """
-    Query the FAISS index and return an answer with citations.
+    Query the LlamaIndex and return an answer with citations.
     Uses lexical match, keyword match, and category match to boost results.
     """
     question = payload.question or ""
@@ -553,10 +558,10 @@ def query(payload: QueryPayload):
     if not question.strip():
         raise HTTPException(status_code=400, detail="Empty question")
 
-    # Load FAISS index
-    index = get_faiss_index()
+    # Load the LlamaIndex
+    index = load_llama_index()
     if index is None:
-        raise HTTPException(status_code=500, detail="No FAISS index found")
+        raise HTTPException(status_code=500, detail="No LlamaIndex found")
 
     # Fetch document metadata
     conn = get_db()
@@ -564,16 +569,14 @@ def query(payload: QueryPayload):
     all_docs = docs_tbl.search().to_list()
     doc_map = {d["doc_id"]: d for d in all_docs}
 
-    # Tokenize question
+    # Tokenize question and determine category
     tokens = [tok for tok in re.findall(r"[a-zA-Z0-9']+", question.lower()) if tok]
-
-    # Determine question category
     category = determine_question_category(question)
 
-    # Run similarity search in FAISS
-    retrieved = index.similarity_search(question, k=top_k * 5)
-
-    if not retrieved:
+    # Retrieve candidate nodes using LlamaIndex (oversample)
+    retriever = index.as_retriever(similarity_top_k=top_k * OVER_SAMPLE)
+    nodes = retriever.retrieve(question)
+    if not nodes:
         return {"answer": "I couldn't find relevant content.", "citations": []}
 
     # Identify docs whose keywords intersect with question tokens
@@ -585,56 +588,47 @@ def query(payload: QueryPayload):
 
     # Rank results by lexical match, keyword match, and category
     candidates = []
-    for idx, doc in enumerate(retrieved):
-        meta = doc.metadata or {}
-        text_lower = doc.page_content.lower()
-        lex_match = 1 if any(tok in text_lower for tok in tokens) else 0
+    for idx, node in enumerate(nodes):
+        meta = node.metadata or {}
+        text_lower = node.text.lower()
         doc_id = meta.get("doc_id")
-        # Keyword score
+        lex_match = 1 if any(tok in text_lower for tok in tokens) else 0
         if doc_id in keyword_docs:
             kw_score = 10
         else:
             kws = [kw.lower() for kw in (doc_map.get(doc_id, {}).get("keywords") or [])]
             kw_score = sum(1 for kw in kws if kw in question.lower())
-        # Category match
         cat_score = 1 if category and doc_map.get(doc_id, {}).get("category") == category else 0
-        candidates.append((doc, lex_match, kw_score, cat_score, idx))
+        candidates.append((node, lex_match, kw_score, cat_score, idx))
 
     candidates.sort(key=lambda x: (-x[1], -x[2], -x[3], x[4]))
-    top_docs = [d for d, _, _, _, _ in candidates[:top_k]]
 
-    # Build contexts
+    # Build unique contexts per document
     unique_contexts = []
     seen_ids = set()
-    for doc, _, _, _, _ in candidates:
-        doc_id = doc.metadata.get("doc_id")
+    for node, _, _, _, _ in candidates:
+        doc_id = node.metadata.get("doc_id")
         if doc_id in seen_ids:
             continue
         seen_ids.add(doc_id)
         unique_contexts.append({
             "doc_id": doc_id,
-            "page_start": doc.metadata.get("page_start", 1),
-            "page_end": doc.metadata.get("page_end", 1),
-            "text": doc.page_content,
+            "page_start": node.metadata.get("page_start", 1),
+            "page_end": node.metadata.get("page_end", 1),
+            "text": node.text,
         })
         if len(unique_contexts) == top_k:
             break
-        
 
     # Generate answer
     answer = answer_with_context(question, unique_contexts)
 
-    # Build citations with title and source_url, removing duplicates
+    # Build citations with title and source_url
     citations = []
-    seen_docs = set()
     for ctx in unique_contexts:
-        doc_id = ctx["doc_id"]
-        if doc_id in seen_docs:
-            continue
-        seen_docs.add(doc_id)
-        meta = doc_map.get(doc_id, {})
+        meta = doc_map.get(ctx["doc_id"], {})
         citations.append({
-            "doc_id": doc_id,
+            "doc_id": ctx["doc_id"],
             "title": meta.get("title"),
             "source_url": meta.get("source_url"),
             "page_start": ctx["page_start"],
@@ -699,18 +693,21 @@ def _ingest_common(
     title: Optional[str]
 ):
     """
-    Ingest a PDF into a FAISS index.
+    Ingest a PDF using LlamaIndex and store metadata/chunks in LanceDB.
+
     - Parses the PDF with DoclingLoader.
-    - Cleans proprietary/CUI notices from each page.
-    - Splits into overlapping chunks.
-    - Embeds each chunk using OllamaEmbeddings.
-    - Adds the vectors and metadata to a FAISS index stored on disk.
-    - Populates the documents table with high-level metadata, category and keywords.
+    - Removes proprietary/CUI notices from each page.
+    - Splits into overlapping chunks with RecursiveCharacterTextSplitter.
+    - Inserts those chunks as Documents into a persistent LlamaIndex.
+    - Computes embeddings via the HuggingFace embedder and stores chunk text,
+      page ranges and vectors in the LanceDB "chunks" table.
+    - Extracts category and keywords via the LLM.
+    - Upserts document-level metadata into the LanceDB "documents" table.
     """
     if not pdf_bytes:
         raise HTTPException(status_code=400, detail="Empty file")
 
-    # Save PDF to temp file for Docling
+    # Write the PDF to a temp file so DoclingLoader can read it
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(pdf_bytes)
         tmp_path = tmp.name
@@ -724,60 +721,60 @@ def _ingest_common(
     if not documents:
         raise HTTPException(status_code=400, detail="Unable to parse PDF")
 
-    # Clean each page’s content
+    # Strip header/footer noise from each page
     for doc in documents:
         doc.page_content = remove_noise(doc.page_content)
 
-    # Compute SHA of original PDF
+    # Compute a SHA of the raw PDF for deduplication
     sha = sha256_bytes(pdf_bytes)
 
-    # Derive stable doc_id
+    # Stable doc_id: use provided ID or derive from source_url/sha
     base_for_id = (source_url or sha)[:64]
     doc_id = doc_id or hashlib.sha1(base_for_id.encode("utf-8")).hexdigest()
 
-    # Prepare split documents
+    # Chunk the document into overlapping pieces
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
         length_function=len,
     )
     split_docs = splitter.split_documents(documents)
-
     if not split_docs:
         raise HTTPException(status_code=400, detail="No text extracted")
 
-    # Texts and metadata for FAISS
-    texts = []
-    metas = []
+    # Build LlamaIndex Document objects and collect texts for embedding
+    llama_docs: List[LlamaDocument] = []
+    texts: List[str] = []
     for doc_obj in split_docs:
         meta = doc_obj.metadata or {}
         p_start = int(meta.get("page", 1))
         p_end = p_start
-        texts.append(doc_obj.page_content)
-        metas.append({
-            "doc_id": doc_id,
-            "page_start": p_start,
-            "page_end": p_end,
-            "title": title,
-            "source_url": source_url,
-        })
+        text = doc_obj.page_content
+        texts.append(text)
+        llama_docs.append(
+            LlamaDocument(
+                text=text,
+                metadata={
+                    "doc_id": doc_id,
+                    "page_start": p_start,
+                    "page_end": p_end,
+                },
+            )
+        )
 
-     # Load or create the FAISS index and add new vectors
-    index = get_faiss_index()
+    # Insert documents into the LlamaIndex (create if absent)
+    index = load_llama_index()
     if index is None:
-        index = FAISS.from_texts(texts, embedder, metadatas=metas)
+        index = VectorStoreIndex.from_documents(llama_docs, service_context=service_context)
     else:
-        index.add_texts(texts, metadatas=metas)
-    # Persist to disk
-    index.save_local(FAISS_INDEX_PATH)
+        index.insert_documents(llama_docs)
+    # Persist the index to disk
+    index.storage_context.persist(persist_dir=LLAMA_INDEX_PATH)
 
-    # Compute embeddings for storing in LanceDB (reuse the same embedder)
+    # Compute embeddings for LanceDB and store chunk info
     vecs = embedder.embed_documents(texts)
-
-    # Store each chunk into the chunks table
     conn = get_db()
     docs_tbl, chunks_tbl = get_or_create_tables(conn)
-    # Remove old chunks for this doc_id
     chunks_tbl.delete(f"doc_id == '{doc_id}'")
     chunk_rows = []
     for doc_obj, vec in zip(split_docs, vecs):
@@ -791,16 +788,16 @@ def _ingest_common(
             "page_start": p_start,
             "page_end": p_end,
             "text": content,
-            "embedding": vec
+            "embedding": vec,
         })
     if chunk_rows:
         chunks_tbl.add(chunk_rows)
 
-    # Extract category and keywords using the LLM
+    # Use the LLM to classify the document and extract keywords
     full_text = "\n\n".join([d.page_content for d in documents])
     category, keywords = extract_extra_metadata(full_text)
 
-    # Document-level metadata stored in the existing LanceDB "documents" table
+    # Upsert high-level document metadata
     page_count = len(documents)
     docs_tbl.delete(f"doc_id == '{doc_id}'")
     docs_tbl.add([{
@@ -816,4 +813,4 @@ def _ingest_common(
         "keywords": keywords,
     }])
 
-    return {"status": "ok", "doc_id": doc_id, "chunks": len(texts)}
+    return {"status": "ok", "doc_id": doc_id, "chunks": len(chunk_rows)}
