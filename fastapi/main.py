@@ -46,7 +46,7 @@ from llama_index.embeddings.langchain import LangchainEmbedding
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://ollama:11434")
 EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL","sentence-transformers/all-mpnet-base-v2")
 GEN_MODEL = os.getenv("OLLAMA_GEN_MODEL", "llama3.2:latest")
-OVER_SAMPLE = os.getenv("OVER_SAMPLE", 10)
+OVER_SAMPLE = int(os.getenv("OVER_SAMPLE", "10"))
 # Vector DB
 LANCEDB_URI = os.getenv("LANCEDB_URI", "/data/lancedb")
 
@@ -552,6 +552,7 @@ def query(payload: QueryPayload):
     """
     Query the LlamaIndex and return an answer with citations.
     Uses lexical match, keyword match, and category match to boost results.
+    Collects up to MAX_CHUNKS_PER_DOC chunks per document.
     """
     question = payload.question or ""
     top_k = payload.top_k
@@ -573,8 +574,14 @@ def query(payload: QueryPayload):
     tokens = [tok for tok in re.findall(r"[a-zA-Z0-9']+", question.lower()) if tok]
     category = determine_question_category(question)
 
+    # Ensure OVER_SAMPLE is an integer; use env var default if absent
+    try:
+        over_sample = int(os.getenv("OVER_SAMPLE", "10"))
+    except ValueError:
+        over_sample = 10
+
     # Retrieve candidate nodes using LlamaIndex (oversample)
-    retriever = index.as_retriever(similarity_top_k=top_k * OVER_SAMPLE)
+    retriever = index.as_retriever(similarity_top_k=top_k * over_sample)
     nodes = retriever.retrieve(question)
     if not nodes:
         return {"answer": "I couldn't find relevant content.", "citations": []}
@@ -603,29 +610,44 @@ def query(payload: QueryPayload):
 
     candidates.sort(key=lambda x: (-x[1], -x[2], -x[3], x[4]))
 
-    # Build unique contexts per document
-    unique_contexts = []
-    seen_ids = set()
+    # Collect up to MAX_CHUNKS_PER_DOC chunks for each document
+    MAX_CHUNKS_PER_DOC = 3
+    doc_contexts = {}
     for node, _, _, _, _ in candidates:
         doc_id = node.metadata.get("doc_id")
-        if doc_id in seen_ids:
+        if not doc_id:
             continue
-        seen_ids.add(doc_id)
-        unique_contexts.append({
+        lst = doc_contexts.setdefault(doc_id, [])
+        if len(lst) < MAX_CHUNKS_PER_DOC:
+            lst.append(node.text)
+        # Stop once we have enough documents with enough chunks
+        if len(doc_contexts) >= top_k and all(len(v) >= MAX_CHUNKS_PER_DOC for v in doc_contexts.values()):
+            break
+
+    # Flatten into the format expected by answer_with_context
+    contexts = []
+    for doc_id, texts in doc_contexts.items():
+        meta = doc_map.get(doc_id, {})
+        combined_text = "\n\n".join(texts)
+        # Use the page range of the first chunk for the citation (fall back to 1)
+        first_node = next(n for n, *_ in candidates if n.metadata.get("doc_id") == doc_id)
+        page_start = first_node.metadata.get("page_start", 1)
+        page_end = first_node.metadata.get("page_end", 1)
+        contexts.append({
             "doc_id": doc_id,
-            "page_start": node.metadata.get("page_start", 1),
-            "page_end": node.metadata.get("page_end", 1),
-            "text": node.text,
+            "page_start": page_start,
+            "page_end": page_end,
+            "text": combined_text,
         })
-        if len(unique_contexts) == top_k:
+        if len(contexts) == top_k:
             break
 
     # Generate answer
-    answer = answer_with_context(question, unique_contexts)
+    answer = answer_with_context(question, contexts)
 
-    # Build citations with title and source_url
+    # Build citations
     citations = []
-    for ctx in unique_contexts:
+    for ctx in contexts:
         meta = doc_map.get(ctx["doc_id"], {})
         citations.append({
             "doc_id": ctx["doc_id"],
@@ -636,6 +658,8 @@ def query(payload: QueryPayload):
         })
 
     return {"answer": answer, "citations": citations}
+
+
 
 @app.get("/documents")
 def list_documents():
