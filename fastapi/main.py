@@ -47,6 +47,7 @@ OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://ollama:11434")
 EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL","sentence-transformers/all-mpnet-base-v2")
 GEN_MODEL = os.getenv("OLLAMA_GEN_MODEL", "llama3.2:latest")
 OVER_SAMPLE = int(os.getenv("OVER_SAMPLE", "10"))
+FULLDOC_MAX_CHARS = int(os.getenv("FULLDOC_MAX_CHARS", "12000"))
 # Vector DB
 LANCEDB_URI = os.getenv("LANCEDB_URI", "/data/lancedb")
 
@@ -141,6 +142,43 @@ def get_or_create_tables(conn: LanceDBConnection):
 # ---------------------------
 # Utility helpers
 # ---------------------------
+def _build_full_doc_context(doc_id: str, max_chars: int = 12000) -> Dict[str, Any]:
+    """
+    Load *all* chunks for a document from LanceDB, sort by page, join, and trim to max_chars.
+    Returns a single context dict compatible with answer_with_context().
+    """
+    conn = get_db()
+    _, chunks_tbl = get_or_create_tables(conn)
+
+    # pull all chunks for the doc
+    rows = list(chunks_tbl.search().where(f"doc_id == '{doc_id}'").to_list())
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"No chunks found for doc_id={doc_id}")
+
+    # sort by page then by a stable key to keep order consistent
+    rows.sort(key=lambda r: (int(r.get("page_start", 1)), r.get("chunk_id", "")))
+
+    full_text = "\n\n".join(r["text"] for r in rows if r.get("text"))
+    if not full_text.strip():
+        raise HTTPException(status_code=400, detail=f"Empty text for doc_id={doc_id}")
+
+    # trim to fit llm context (approx char budget; tune with env)
+    max_chars = int(os.getenv("FULLDOC_MAX_CHARS", str(max_chars)))
+    trimmed = full_text[:max_chars]
+
+    # derive page range from first/last
+    first = rows[0]
+    last = rows[-1]
+    page_start = int(first.get("page_start", 1))
+    page_end = int(last.get("page_end", page_start))
+
+    return {
+        "doc_id": doc_id,
+        "page_start": page_start,
+        "page_end": page_end,
+        "text": trimmed,
+    }
+
 def load_llama_index() -> Optional[VectorStoreIndex]:
     """
     Load the LlamaIndex vector index from disk, or return None if it doesn't exist.
@@ -258,10 +296,10 @@ def answer_with_context(question: str, contexts: List[Dict[str, Any]]) -> str:
     """
     Very light instruct prompt with inline citations [1], [2], ...
     """
-    parts = ["You are ADAM, a helpful assistant. Use the CONTEXT to answer."]
+    parts = ["You are ADAM, a helpful assistant. Use the documents to answer."]
     for i, ctx in enumerate(contexts, 1):
-        parts.append(f"[{i}] doc_id={ctx['doc_id']} pgs {ctx['page_start']}-{ctx['page_end']}:\n{ctx['text'][:1200]}")
-    parts.append(f"Question: {question}\nAnswer clearly with citations like [1], [2] where used.")
+        parts.append(f"[{i}] doc_id={ctx['doc_id']} pgs {ctx['page_start']}-{ctx['page_end']}:\n{ctx['text'][:FULLDOC_MAX_CHARS]}")
+    parts.append(f"Question: {question}\nAnswer clearly with details and citations like [1], [2] where used. Dont say anything about what the document does not cover,instead say for further detals you inspect the linked document(s) ")
     prompt = "\n\n".join(parts)
 
     resp = client.chat(
@@ -347,10 +385,20 @@ class IngestText(BaseModel):
     source_url: Optional[str] = None
     title: Optional[str] = None
 
+class QueryFullPayload(BaseModel):
+    question: str
+    top_docs: int = 1           # how many documents to pull fully (usually 1)
+    over_sample: int = 10       # oversample factor for retriever before selecting top_docs
 
 class QueryPayload(BaseModel):
     question: str
     top_k: int = 6
+    # optionally specify a document identifier to use the entire document as context
+    # when provided, the query endpoint will bypass the retrieval pipeline and
+    # instead assemble the full text for the given document from the database.
+    # This can be useful when testing the system with only a single document
+    # and you want the language model to have access to all available content.
+    doc_id: Optional[str] = None
 
 
 class DeleteDocumentPayload(BaseModel):
@@ -547,6 +595,66 @@ def ingest_text(payload: IngestText):
 # -----------------------------------------
 # Query Endpoint with category + keyword logic
 # -----------------------------------------
+@app.post("/query_full")
+def query_full(payload: QueryFullPayload):
+    """
+    Retrieve with LlamaIndex, pick top N documents, then provide the *full* document
+    (all chunks concatenated and trimmed) as context to the LLM. No term heuristics,
+    no hard-coded expansions.
+    """
+    question = (payload.question or "").strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="Empty question")
+
+    index = load_llama_index()
+    if index is None:
+        raise HTTPException(status_code=500, detail="No LlamaIndex found")
+
+    # retrieve many nodes, then select top_docs (by doc_id order of appearance)
+    over_sample = max(1, int(payload.over_sample))
+    retriever = index.as_retriever(similarity_top_k=over_sample * 10)
+    nodes = retriever.retrieve(question)
+    if not nodes:
+        return {"answer": "I couldn't find relevant content.", "citations": []}
+
+    # preserve order; collect unique doc_ids
+    seen = set()
+    doc_ids = []
+    for n in nodes:
+        did = (n.metadata or {}).get("doc_id")
+        if did and did not in seen:
+            seen.add(did)
+            doc_ids.append(did)
+        if len(doc_ids) >= payload.top_docs:
+            break
+
+    if not doc_ids:
+        return {"answer": "I couldn't find relevant content.", "citations": []}
+
+    # build full contexts for selected docs
+    contexts = [_build_full_doc_context(did) for did in doc_ids]
+
+    # answer
+    answer = answer_with_context(question, contexts)
+
+    # citations from documents table
+    conn = get_db()
+    docs_tbl, _ = get_or_create_tables(conn)
+    meta_map = {d["doc_id"]: d for d in docs_tbl.search().to_list()}
+
+    citations = []
+    for ctx in contexts:
+        meta = meta_map.get(ctx["doc_id"], {})
+        citations.append({
+            "doc_id": ctx["doc_id"],
+            "title": meta.get("title"),
+            "source_url": meta.get("source_url"),
+            "page_start": ctx["page_start"],
+            "page_end": ctx["page_end"],
+        })
+
+    return {"answer": answer, "citations": citations}
+
 @app.post("/query")
 def query(payload: QueryPayload):
     """
@@ -566,9 +674,50 @@ def query(payload: QueryPayload):
 
     # Fetch document metadata
     conn = get_db()
-    docs_tbl, _ = get_or_create_tables(conn)
+    docs_tbl, chunks_tbl = get_or_create_tables(conn)
     all_docs = docs_tbl.search().to_list()
     doc_map = {d["doc_id"]: d for d in all_docs}
+
+    # ----------------------------------------------------------------------
+    # Optional direct document lookup. When a specific doc_id is provided
+    # the API will bypass the embedding-based retrieval pipeline and instead
+    # assemble the full text for the requested document and use it as the
+    # context. This is useful when only a single document exists in the
+    # database (e.g. during early testing) and you want the model to have
+    # access to all available content without relying on the chunk retriever.
+    if payload.doc_id:
+        doc_id = payload.doc_id
+        # Ensure the document exists
+        if doc_id not in doc_map:
+            raise HTTPException(status_code=404, detail=f"Document {doc_id} not found")
+        # Collect all chunks for the document
+        try:
+            rows = list(chunks_tbl.search().where("doc_id == ?", [doc_id]).to_list())
+        except Exception:
+            # Fallback to scanning all rows if where() is not supported
+            rows = [row for row in chunks_tbl.search().to_list() if row.get("doc_id") == doc_id]
+        if not rows:
+            return {"answer": "No content found for the requested document.", "citations": []}
+        # Sort rows by page_start (ascending) to maintain document order
+        rows.sort(key=lambda r: r.get("page_start", 0))
+        full_text = "\n\n".join(r.get("text", "") for r in rows)
+        # Build a single context entry spanning the entire document
+        context = {
+            "doc_id": doc_id,
+            "page_start": rows[0].get("page_start", 1),
+            "page_end": rows[-1].get("page_end", rows[0].get("page_start", 1)),
+            "text": full_text,
+        }
+        # Generate answer using the full document context
+        answer = answer_with_context(question, [context])
+        citations = [{
+            "doc_id": doc_id,
+            "title": doc_map[doc_id].get("title"),
+            "source_url": doc_map[doc_id].get("source_url"),
+            "page_start": context["page_start"],
+            "page_end": context["page_end"],
+        }]
+        return {"answer": answer, "citations": citations}
 
     # Tokenize question and determine category
     tokens = [tok for tok in re.findall(r"[a-zA-Z0-9']+", question.lower()) if tok]
