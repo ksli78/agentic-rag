@@ -346,8 +346,8 @@ def answer_with_context(question: str, contexts: List[Dict[str, Any]]) -> str:
         parts.append(f"[{i}] doc_id={ctx['doc_id']} pgs {ctx['page_start']}-{ctx['page_end']}:\n{snippet}")
     parts.append(
         "Question: " + question + "\n"
-        "Answer clearly and with detail, Add bracket citations like [1], [2] right after the sentences they support. your answer must be formatted in HTML with tables,"
-        "lists, paragraphs"
+        "Answer clearly and with friendly tone, Add bracket citations like [1], [2] right after the sentences they support."
+        " your answer must be formatted in HTML with tables,lists, paragraphs"
     )
     prompt = "\n\n".join(parts)
     resp = client.chat(
