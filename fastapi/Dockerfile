@@ -1,33 +1,37 @@
 FROM python:3.11-slim
 
-ENV DEBIAN_FRONTEND=noninteractive \
-    PIP_NO_CACHE_DIR=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    RETRIEVER=llama \
-    MAX_CHUNKS_PER_DOC=3 \
-    W_LEX=1 \
-    W_KW=1 \
-    W_CAT=1 \
-    OLLAMA_SEED=42 \
-    GEN_TEMPERATURE=0.2 \
-    GEN_TOP_P=1.0 \
-    GEN_REPEAT_PENALTY=1.0 \
-    GEN_NUM_CTX=6
+# (Optional) system deps if needed by docling/pymupdf/poppler; try without first
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# small toolset
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      tini curl ca-certificates \
-  && rm -rf /var/lib/apt/lists/*
+# requirements
+COPY <<'PIP' /app/requirements.txt
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+pydantic==2.9.2
+pydantic-settings==2.4.0
+httpx==0.27.2
+numpy==1.26.4
+lancedb==0.11.0
+# Docling
+docling==2.15.0
+docling-core==2.15.0
+# Required for UploadFile/Form
+python-multipart==0.0.9
+# If you want FAISS optional later:
+# faiss-cpu==1.8.0
+PIP
 
-COPY requirements.txt /app/requirements.txt
-RUN python -m pip install --upgrade pip setuptools wheel \
- && pip install -r /app/requirements.txt
 
-COPY . /app/
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . /app
+
+# create data dir for LanceDB
+RUN mkdir -p /data/lancedb
 
 EXPOSE 8000
-ENTRYPOINT ["/usr/bin/tini","--"]
-CMD ["uvicorn","main:app","--host","0.0.0.0","--port","8000"]
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]

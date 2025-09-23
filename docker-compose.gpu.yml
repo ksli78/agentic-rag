@@ -1,0 +1,10 @@
+services:
+  ollama:
+    environment:
+      - OLLAMA_NO_GPU=0        # enable GPU path in Ollama
+    # Compose v2 way to request NVIDIA GPUs:
+    deploy: {}                 # (no swarm needed; empty block avoids errors)
+    device_requests:
+      - driver: nvidia
+        count: -1              # all visible GPUs
+        capabilities: ["gpu"]
