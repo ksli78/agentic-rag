@@ -1,7 +1,7 @@
 # fastapi/models.py
 from typing import List, Optional
 from pydantic import BaseModel, Field
-from lancedb.pydantic import LanceModel, Vector   # <-- use Vector, not vec
+from lancedb.pydantic import LanceModel, Vector
 from config import settings
 
 # ---------- LanceDB table schemas ----------
@@ -21,17 +21,9 @@ class Chunk(LanceModel):
     page_start: int
     page_end: int
     text: str
-    # IMPORTANT: no Vector[...] here; use vec(dim=...)
-    embedding: Vector(settings.embed_dim)   # <-- this works with your lancedb
+    embedding: Vector(settings.embed_dim)  # ← uses EMBED_DIM from .env
 
 # ---------- API request/response models ----------
-
-class IngestUrl(BaseModel):
-    url: str
-    doc_id: Optional[str] = None
-    title: Optional[str] = None
-    category: Optional[str] = None
-    keywords: Optional[List[str]] = None
 
 class IngestJsonPayload(BaseModel):
     doc_id: str
