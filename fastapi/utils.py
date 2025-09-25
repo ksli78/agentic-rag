@@ -1,13 +1,29 @@
-# fastapi/utils.py
+"""Utility functions for embeddings, hashing and LLM interaction.
+
+This module centralises calls to the local Ollama server for
+embedding generation and text generation.  It also contains helper
+functions for computing SHA256 hashes of bytes, splitting Markdown
+into approximately equal sized blocks and computing cosine
+similarities.  These utilities wrap ``httpx`` calls so that the rest
+of the application does not need to know about the network details.
+"""
+
+from __future__ import annotations
+
 import hashlib
 import json
-import httpx
 import logging
-import numpy as np
 from typing import List
+
+import httpx
+import numpy as np
+
+# Import settings from the top-level config module to avoid relative import issues
 from config import settings
 
+
 log = logging.getLogger("api.utils")
+
 
 # ---------- LLM & Embeddings (Ollama) ----------
 
@@ -24,12 +40,22 @@ async def _embed_one_ollama(text: str) -> List[float]:
         log.debug(f"Ollama embeddings response keys: {list(data.keys())}")
         if "embedding" in data and isinstance(data["embedding"], list):
             return data["embedding"]
-        if "data" in data and isinstance(data["data"], list) and data["data"] and "embedding" in data["data"][0]:
+        if (
+            "data" in data
+            and isinstance(data["data"], list)
+            and data["data"]
+            and "embedding" in data["data"][0]
+        ):
             return data["data"][0]["embedding"]
-        if "embeddings" in data and isinstance(data["embeddings"], list) and data["embeddings"]:
+        if (
+            "embeddings" in data
+            and isinstance(data["embeddings"], list)
+            and data["embeddings"]
+        ):
             return data["embeddings"][0]
 
     raise ValueError(f"Unexpected Ollama embeddings response: {data}")
+
 
 async def embed_texts(texts: List[str]) -> List[List[float]]:
     out: List[List[float]] = []
@@ -40,6 +66,7 @@ async def embed_texts(texts: List[str]) -> List[List[float]]:
         out.append(vec)
     return out
 
+
 # ---------- Helpers ----------
 
 def sha256_bytes(b: bytes) -> str:
@@ -47,9 +74,11 @@ def sha256_bytes(b: bytes) -> str:
     h.update(b)
     return h.hexdigest()
 
+
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     denom = (np.linalg.norm(a) * np.linalg.norm(b)) or 1e-9
     return float(np.dot(a, b) / denom)
+
 
 def split_markdown_blocks(md: str, block_size: int) -> List[str]:
     paras = md.split("\n\n")
@@ -70,6 +99,7 @@ def split_markdown_blocks(md: str, block_size: int) -> List[str]:
                 start = cut
     return chunks
 
+
 async def chat_complete(system_prompt: str, user_prompt: str, temperature: float) -> str:
     """Call the Ollama chat API and return the response text."""
     url = f"{settings.ollama_host}/api/chat"
@@ -77,16 +107,16 @@ async def chat_complete(system_prompt: str, user_prompt: str, temperature: float
         "model": settings.ollama_gen_model,
         "messages": [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
+            {"role": "user", "content": user_prompt},
         ],
-        "options": {"temperature": float(temperature or 0)}
+        "options": {"temperature": float(temperature or 0)},
     }
     async with httpx.AsyncClient(timeout=None) as client:
         r = await client.post(url, json=payload)
         r.raise_for_status()
         text = r.content.decode()  # get the raw body
 
-    result = []
+    result: List[str] = []
     for line in text.splitlines():
         if not line.strip():
             continue

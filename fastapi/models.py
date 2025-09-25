@@ -1,12 +1,21 @@
-# fastapi/models.py
+"""Pydantic models for API request/response payloads and data storage.
+
+These models define the schemas used throughout the FastAPI service.  They
+are plain Pydantic ``BaseModel`` subclasses with type hints and
+validation.  The ``Document`` and ``Chunk`` models correspond to
+metadata about uploaded documents and their extracted chunks.  Other
+models encapsulate API requests and responses.
+"""
+
+from __future__ import annotations
+
 from typing import List, Optional
+
 from pydantic import BaseModel, Field
-from lancedb.pydantic import LanceModel, Vector
-from config import settings
 
-# ---------- LanceDB table schemas ----------
 
-class Document(LanceModel):
+class Document(BaseModel):
+    """Metadata for an ingested document."""
     doc_id: str
     title: Optional[str] = None
     source_url: Optional[str] = None
@@ -15,38 +24,16 @@ class Document(LanceModel):
     category: Optional[str] = None
     keywords: Optional[List[str]] = None
 
-class Chunk(LanceModel):
+
+class Chunk(BaseModel):
+    """Represents a contiguous block of text extracted from a document."""
     doc_id: str
     chunk_id: str
     page_start: int
     page_end: int
     text: str
-    embedding: Vector(settings.embed_dim)  # ← uses EMBED_DIM from .env
+    embedding: List[float]
 
-# ---------- API request/response models ----------
-
-class IngestJsonPayload(BaseModel):
-    doc_id: str
-    title: Optional[str] = None
-    source_url: Optional[str] = None
-    text: str
-    num_pages: Optional[int] = 1
-    category: Optional[str] = None
-    keywords: Optional[List[str]] = None
-
-class IngestResponse(BaseModel):
-    status: str
-    doc_id: str
-    chunks: int
-    category: Optional[str] = None
-    keywords: Optional[List[str]] = None
-
-class DeleteDocumentPayload(BaseModel):
-    doc_id: str
-
-class DeleteResponse(BaseModel):
-    status: str
-    doc_id: str
 
 class Citation(BaseModel):
     doc_id: str
@@ -55,17 +42,29 @@ class Citation(BaseModel):
     page_start: int
     page_end: int
 
+
+class IngestResponse(BaseModel):
+    status: str
+    doc_id: str
+    chunks: int
+    category: Optional[str] = None
+    keywords: Optional[List[str]] = None
+
+
 class QueryPayload(BaseModel):
     question: str = Field(..., min_length=1)
     top_k: int = Field(3, ge=1, le=10)
     temperature: Optional[float] = Field(None, ge=0.0, le=1.0)
 
+
 class QueryResponse(BaseModel):
     answer: str
     citations: List[Citation]
 
+
 class DocumentsResponse(BaseModel):
     documents: List[Document]
+
 
 class DocumentWithChunksResponse(BaseModel):
     document: Document

@@ -4,7 +4,7 @@ services:
     container_name: ollama
     ports: ["11434:11434"]
     environment:
-      - OLLAMA_NO_GPU=1       # <-- CPU mode by default
+      - OLLAMA_NO_GPU=1
       - OLLAMA_KEEP_ALIVE=24h
     volumes:
       - ollama:/root/.ollama
@@ -23,10 +23,10 @@ services:
     env_file: [.env]
     environment:
       - OLLAMA_HOST=${OLLAMA_HOST:-http://ollama:11434}
-      # (… your other envs …)
+      # (add any other environment variables here)
     ports: ["8000:8000"]
     volumes:
-      - lancedb:/data/lancedb
+      - faiss_index:/data/faiss_index
       - docling_cache:/root/.cache
     depends_on:
       ollama:
@@ -35,6 +35,5 @@ services:
 
 volumes:
   ollama:
-  lancedb:
-  faiss_index: 
+  faiss_index:
   docling_cache:
