@@ -79,28 +79,47 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     denom = (np.linalg.norm(a) * np.linalg.norm(b)) or 1e-9
     return float(np.dot(a, b) / denom)
 
-
 def split_markdown_blocks(md: str, block_size: int) -> List[str]:
     import re
     lines = md.splitlines()
-    paras, current = [], []
+    paras = []
+    current = []
+    heading_accum = []  # holds a heading and its list items
+
+    def flush_heading():
+        # Append accumulated heading+list as one paragraph
+        nonlocal heading_accum
+        if heading_accum:
+            paras.append("\n".join(heading_accum).strip())
+            heading_accum = []
+
     for line in lines:
         stripped = line.strip()
-        # If this line is a heading or list item, start a new paragraph
-        if (stripped.startswith(("#", "-", "*")) or re.match(r"^\d+[.)]", stripped)):
-            if current:
-                paras.append("\n".join(current).strip())
-                current = []
-            current.append(line)
+        is_heading = stripped.startswith("#")
+        is_list = (stripped.startswith("-") or stripped.startswith("*")
+                   or re.match(r"^\d+[.)]", stripped) is not None)
+
+        if is_heading:
+            flush_heading()
+            # headings start a new accumulated block
+            heading_accum = [line]
+        elif heading_accum and is_list:
+            # attach list items to the current heading
+            heading_accum.append(line)
         elif stripped == "":
+            flush_heading()
             if current:
                 paras.append("\n".join(current).strip())
                 current = []
         else:
+            flush_heading()
             current.append(line)
+
+    flush_heading()
     if current:
         paras.append("\n".join(current).strip())
-    # Now break long paragraphs by block_size
+
+    # Now split long paragraphs by block_size
     chunks = []
     for p in paras:
         if len(p) <= block_size:
@@ -109,11 +128,13 @@ def split_markdown_blocks(md: str, block_size: int) -> List[str]:
             start = 0
             while start < len(p):
                 end = min(start + block_size, len(p))
+                # cut at a newline if possible
                 nl = p.rfind("\n", start, end)
                 cut = nl if nl > start + 100 else end
                 chunks.append(p[start:cut].strip())
                 start = cut
     return chunks
+
 
 
 

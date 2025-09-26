@@ -150,7 +150,8 @@ def _citations_for(chunks: List[Dict[str, any]]) -> List[Citation]:
 async def query(payload: QueryPayload) -> QueryResponse:
     """
     Answer a question using hybrid search over ingested documents and a cross-encoder
-    re-ranker for improved relevance.
+    re-ranker for improved relevance.  Keywords in the question are used to bias
+    the final ranking so that passages containing the query terms are prioritized.
     """
     question = payload.question.strip()
     if not question:
@@ -164,7 +165,8 @@ async def query(payload: QueryPayload) -> QueryResponse:
     candidate_pool = payload.top_k * 10
     # Perform the hybrid (dense + lexical) search.
     results = store.search(qvec, question, top_k=candidate_pool)
-    # Extract meaningful keywords from the query
+
+    # Extract meaningful keywords from the question
     query_keywords = extract_keywords(question)
     # Filter out candidate chunks that share no keywords with the query
     filtered = [
@@ -172,7 +174,7 @@ async def query(payload: QueryPayload) -> QueryResponse:
         for meta in results
         if has_keyword_overlap(query_keywords, _get_chunk_text(meta))
     ]
-
+    # Use the filtered set if it’s non-empty; otherwise fall back to all results
     if filtered:
         results = filtered
 
@@ -191,14 +193,27 @@ async def query(payload: QueryPayload) -> QueryResponse:
             _RE_RANKER.predict,
             pairs
         )
-        # Pair each meta with its score, then sort descending
+        # ---------------------------------------
+        # Keyword-weighted re-ranking section:
+        # Boost the score of any chunk containing a query keyword.
+        keyword_weights = []
+        for meta in results:
+            text = _get_chunk_text(meta).lower()
+            # If any query keyword appears in the text, ratio=1.0; otherwise 0.0
+            ratio = 1.0 if any(kw in text for kw in query_keywords) else 0.0
+            # Weight = 1.0 + ratio (doubling the score for keyword-containing chunks)
+            keyword_weights.append(1.0 + ratio)
+        # Multiply cross-encoder scores by weights
+        weighted_scores = [s * w for s, w in zip(scores, keyword_weights)]
+        # Sort by weighted_scores descending
         scored_results = sorted(
-            zip(results, scores),
+            zip(results, weighted_scores),
             key=lambda x: x[1],
             reverse=True
         )
-        # Update results to the re-ranked order
+        # Update results to the weighted re-ranked order
         results = [meta for meta, _ in scored_results]
+        # ---------------------------------------
 
     # If no results, fall back to portal link
     if not results:
@@ -242,7 +257,11 @@ async def query(payload: QueryPayload) -> QueryResponse:
     )
 
     # Determine temperature
-    temperature = payload.temperature if payload.temperature is not None else settings.default_temperature
+    temperature = (
+        payload.temperature
+        if payload.temperature is not None
+        else settings.default_temperature
+    )
 
     # Generate answer using Ollama chat API
     answer = await chat_complete(SYSTEM_PROMPT, user_prompt, temperature=temperature)
@@ -251,3 +270,4 @@ async def query(payload: QueryPayload) -> QueryResponse:
     citations = _citations_for(selected_chunks)
 
     return QueryResponse(answer=answer, citations=citations)
+
