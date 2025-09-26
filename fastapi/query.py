@@ -61,6 +61,13 @@ DOMAIN_STOPWORDS = {
     "employee", "employees", "company", "department",
     "division", "section", "subsection",
 }
+
+# Build a mapping of acronyms to their full-word tokens, e.g. {'pto': ['paid','time','off']}
+SYNONYMS_MAP: dict[str, list[str]] = {}
+acronym_pattern = re.compile(r'([A-Za-z][A-Za-z ]+?)\\s*\\(\\s*([A-Za-z]{2,})\\s*\\)')
+
+
+
 # System prompt that constrains the behaviour of the assistant.
 SYSTEM_PROMPT = (
     "You are a helpful assistant for company policy Q&A. "
@@ -171,6 +178,18 @@ def _citations_for(chunks: List[Dict[str, any]]) -> List[Citation]:
         )
     return citations
 
+
+for text in store.chunk_texts:
+    for match in acronym_pattern.finditer(text):
+        phrase = match.group(1).lower()      # e.g. "paid time off"
+        acronym = match.group(2).lower()     # e.g. "pto"
+        tokens = [tok for tok in tokenize(phrase)
+                  if tok not in COMMON_STOPWORDS
+                  and tok not in DOMAIN_STOPWORDS]
+        if tokens:
+            SYNONYMS_MAP[acronym] = tokens
+
+
 @query_router.post("/query", response_model=QueryResponse)
 async def query(payload: QueryPayload) -> QueryResponse:
     """
@@ -193,6 +212,18 @@ async def query(payload: QueryPayload) -> QueryResponse:
 
     # Extract meaningful keywords from the question
     query_keywords = extract_keywords(question)
+
+    # Expand keywords using the synonyms map (if any matches)
+    expanded = set(query_keywords)
+    
+    for kw in query_keywords:
+        if kw in SYNONYMS_MAP:
+            # add all the words that define the acronym to the search keywords
+            expanded.update(SYNONYMS_MAP[kw])
+    # Use the expanded keyword set
+    query_keywords = list(expanded)
+
+
     # Filter out candidate chunks that share no keywords with the query
     filtered = [
         meta
@@ -207,7 +238,7 @@ async def query(payload: QueryPayload) -> QueryResponse:
     # extend the top results to include the next chunk from each doc
     extended_results = extend_chunks(results, max_extra=1)
     results = extended_results
-    
+
     # If the re-ranker is loaded, use it to score each candidate chunk.
     # This step will reorder 'results' so that the most relevant passages
     # (according to the cross-encoder) appear first.
