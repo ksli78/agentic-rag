@@ -81,12 +81,28 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def split_markdown_blocks(md: str, block_size: int) -> List[str]:
-    paras = md.split("\n\n")
-    chunks: List[str] = []
+    import re
+    lines = md.splitlines()
+    paras, current = [], []
+    for line in lines:
+        stripped = line.strip()
+        # If this line is a heading or list item, start a new paragraph
+        if (stripped.startswith(("#", "-", "*")) or re.match(r"^\d+[.)]", stripped)):
+            if current:
+                paras.append("\n".join(current).strip())
+                current = []
+            current.append(line)
+        elif stripped == "":
+            if current:
+                paras.append("\n".join(current).strip())
+                current = []
+        else:
+            current.append(line)
+    if current:
+        paras.append("\n".join(current).strip())
+    # Now break long paragraphs by block_size
+    chunks = []
     for p in paras:
-        p = p.strip()
-        if not p:
-            continue
         if len(p) <= block_size:
             chunks.append(p)
         else:
@@ -98,6 +114,7 @@ def split_markdown_blocks(md: str, block_size: int) -> List[str]:
                 chunks.append(p[start:cut].strip())
                 start = cut
     return chunks
+
 
 
 async def chat_complete(system_prompt: str, user_prompt: str, temperature: float) -> str:

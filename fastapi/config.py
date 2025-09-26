@@ -30,8 +30,8 @@ class Settings(BaseSettings):
     chunks_path: str = "/data/chunks.json"
 
     # Chunking and retrieval
-    chunk_size: int = 1200
-    chunk_overlap: int = 200
+    chunk_size: int = 600
+    chunk_overlap: int = 100
     min_sim_threshold: float = 0.30
     max_context_docs: int = 3
     max_chunks_per_doc: int = 13
