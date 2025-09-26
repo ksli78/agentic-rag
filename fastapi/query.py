@@ -64,7 +64,13 @@ DOMAIN_STOPWORDS = {
 
 # Build a mapping of acronyms to their full-word tokens, e.g. {'pto': ['paid','time','off']}
 SYNONYMS_MAP: dict[str, list[str]] = {}
-acronym_pattern = re.compile(r'([A-Za-z][A-Za-z ]+?)\\s*\\(\\s*([A-Za-z]{2,})\\s*\\)')
+# Regex to match phrases like "Paid Time Off (PTO)" or "Paid Time Off – PTO"
+_ACRONYM_REGEX = re.compile(
+    r'([A-Z][a-zA-Z]*(?:\s+[A-Z][a-zA-Z]*)+)\s*'       # phrase with capitalised words
+    r'[\(\-–—]\s*'                                    # left delimiter (parenthesis or dash)
+    r'([A-Z]{2,})\s*'                                  # acronym (2+ uppercase letters)
+    r'[\)\-–—]'                                        # right delimiter
+)
 
 
 
@@ -179,16 +185,21 @@ def _citations_for(chunks: List[Dict[str, any]]) -> List[Citation]:
     return citations
 
 
-for text in store.chunk_texts:
-    for match in acronym_pattern.finditer(text):
-        phrase = match.group(1).lower()      # e.g. "paid time off"
-        acronym = match.group(2).lower()     # e.g. "pto"
-        tokens = [tok for tok in tokenize(phrase)
-                  if tok not in COMMON_STOPWORDS
-                  and tok not in DOMAIN_STOPWORDS]
-        if tokens:
-            SYNONYMS_MAP[acronym] = tokens
+def _build_synonyms_map():
+    """Extract acronym mappings from the corpus."""
+    global SYNONYMS_MAP
+    for text in store.chunk_texts:
+        for phrase, acronym in _ACRONYM_REGEX.findall(text):
+            tokens = [
+                tok.lower() for tok in phrase.split()
+                if tok.lower() not in COMMON_STOPWORDS
+                and tok.lower() not in DOMAIN_STOPWORDS
+            ]
+            if tokens:
+                SYNONYMS_MAP[acronym.lower()] = tokens
 
+# Call this once when FastAPI starts
+_build_synonyms_map()
 
 @query_router.post("/query", response_model=QueryResponse)
 async def query(payload: QueryPayload) -> QueryResponse:
