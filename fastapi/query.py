@@ -72,6 +72,31 @@ SYSTEM_PROMPT = (
 def tokenize(text: str) -> list[str]:
     """Split text into lowercase alphanumeric tokens."""
     return re.findall(r"[a-z0-9']+", text.lower())
+def extend_chunks(chunks, max_extra=1):
+    """
+    Given a list of ranked chunk metadata, append up to `max_extra` subsequent
+    chunks from the same document for each chunk.  Avoid duplicates.
+    """
+    extended = []
+    seen = set()
+    for meta in chunks:
+        cid = meta["chunk_id"]
+        doc_id = meta["doc_id"]
+        # always keep the original chunk
+        if cid not in seen:
+            extended.append(meta)
+            seen.add(cid)
+        # find the next `max_extra` chunks in the same document
+        extras_added = 0
+        for m in store.chunk_metadata:
+            if m["doc_id"] == doc_id and m["chunk_id"] > cid:
+                if m["chunk_id"] not in seen:
+                    extended.append(m)
+                    seen.add(m["chunk_id"])
+                    extras_added += 1
+                    if extras_added >= max_extra:
+                        break
+    return extended
 
 def extract_keywords(text: str) -> list[str]:
     """Remove common and domain stopwords from tokens."""
@@ -178,6 +203,11 @@ async def query(payload: QueryPayload) -> QueryResponse:
     if filtered:
         results = filtered
 
+    # after results have been re-ranked by the cross-encoder
+    # extend the top results to include the next chunk from each doc
+    extended_results = extend_chunks(results, max_extra=1)
+    results = extended_results
+    
     # If the re-ranker is loaded, use it to score each candidate chunk.
     # This step will reorder 'results' so that the most relevant passages
     # (according to the cross-encoder) appear first.
