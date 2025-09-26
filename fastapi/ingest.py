@@ -21,6 +21,7 @@ from config import settings
 from models import IngestResponse
 from storage import store
 from utils import sha256_bytes, embed_texts, split_markdown_blocks
+from utils import extract_category_keywords  # new import
 
 log = logging.getLogger("api.ingest")
 
@@ -114,10 +115,22 @@ async def ingest_upload(
     if len(embeddings) != len(raw_chunks):
         log.error(f"Embedding count mismatch: chunks={len(raw_chunks)} embeddings={len(embeddings)}")
         raise HTTPException(status_code=500, detail="Embedding mismatch; check Ollama embeddings endpoint.")
+    
     # Determine final document ID
     final_doc_id = doc_id or str(uuid.uuid4())
     kw_list = [k.strip() for k in (keywords or "").split(",") if k.strip()] or None
-    # Build document metadata
+
+    # Auto-generate category and keywords via LLM if not provided
+    if (not category) or (not kw_list):
+        # Use a portion of the original Markdown text for extraction
+        doc_excerpt = md_text[:4096]
+        cat_pred, kw_pred = await extract_category_keywords(doc_excerpt)
+        if not category and cat_pred:
+            category = cat_pred
+        if not kw_list and kw_pred:
+            kw_list = kw_pred
+
+    # Build document metadata with the possibly updated category/keywords
     doc_meta = {
         "doc_id": final_doc_id,
         "title": title or file.filename,
@@ -127,6 +140,7 @@ async def ingest_upload(
         "category": category,
         "keywords": kw_list,
     }
+
     # Build chunk metadata
     chunk_meta: List[dict] = []
     for _ in range(len(raw_chunks)):

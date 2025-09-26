@@ -1,3 +1,4 @@
+from __future__ import annotations
 """API endpoints for querying ingested documents.
 
 This router exposes a single endpoint ``POST /query`` which accepts
@@ -9,8 +10,10 @@ along with properly formatted citations.  If no relevant chunks are
 found the service falls back to a portal URL specified in the
 configuration.
 """
+import re
+import asyncio
+import logging
 
-from __future__ import annotations
 
 from typing import Dict, List
 
@@ -20,11 +23,44 @@ from config import settings
 from models import QueryPayload, QueryResponse, Citation
 from storage import store
 from utils import embed_texts, chat_complete
-
+try:
+    from sentence_transformers import CrossEncoder
+    # Load the lightweight MS MARCO re-ranker on startup
+    _RE_RANKER = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+except Exception as ex:
+    logging.warning(
+        "CrossEncoder re-ranker could not be loaded. "
+        "Falling back to simple hybrid ranking. "
+        f"Error: {ex}"
+    )
+    _RE_RANKER = None
 
 query_router = APIRouter(tags=["query"])
 
-
+# A minimal set of English stopwords
+COMMON_STOPWORDS = {
+    "what", "is", "the", "a", "an", "and", "or", "to", "of", "in", "on",
+    "for", "by", "with", "as", "at", "from", "into", "about", "it",
+}
+# Terms that are too general to be useful for filtering.
+DOMAIN_STOPWORDS = {
+   "NASA", "space", "mission", "division", "ASMD", "Amentum", "rocket",
+   "launch", "satellite", "astronaut", "flight", "engineering", "technical",
+   "safety", "quality", "assurance", "control", "project", "program", "management",
+   "reporting", "contract", "federal", "government", "compliance", "regulation", 
+   "standard", "requirement", "data", "system", "infrastructure", "operations", 
+   "maintenance", "testing", "development", "research", "team", "personnel", 
+   "training", "security", "facility", "asset", "material", "supply", "chain", 
+   "procurement", "finance", "budget", "billing", "travel", "communication", "meeting", 
+   "review", "proposal", "customer", "partner", "performance", "metric", "objective", 
+   "goal", "strategy", "innovation", "technology", "software", "hardware", "tool", 
+   "specification", "analysis", "risk", "mitigation", "hazard", "incident", "investigation", 
+   "manual", "guide", "record", "archive", "timeline", "milestone", "delivery", 
+   "integration", "testing", "validation", "verification", "support", "planning", "strategy", "future",
+   "teammate", "policy", "procedure", "process", "document",
+    "employee", "employees", "company", "department",
+    "division", "section", "subsection",
+}
 # System prompt that constrains the behaviour of the assistant.
 SYSTEM_PROMPT = (
     "You are a helpful assistant for company policy Q&A. "
@@ -33,7 +69,41 @@ SYSTEM_PROMPT = (
     "If the CONTEXT is insufficient, say you don't have the information and provide the portal link given."
     "when referring to the CONTEXT call it the document or the information provided"
 )
+def tokenize(text: str) -> list[str]:
+    """Split text into lowercase alphanumeric tokens."""
+    return re.findall(r"[a-z0-9']+", text.lower())
 
+def extract_keywords(text: str) -> list[str]:
+    """Remove common and domain stopwords from tokens."""
+    return [
+        tok
+        for tok in tokenize(text)
+        if tok not in COMMON_STOPWORDS and tok not in DOMAIN_STOPWORDS
+    ]
+
+def has_keyword_overlap(query_keywords: list[str], chunk_text: str) -> bool:
+    """
+    Return True if the chunk contains any keyword from the query.
+    """
+    chunk_keywords = set(extract_keywords(chunk_text))
+    for keyword in query_keywords:
+        if keyword in chunk_keywords:
+            return True
+    return False
+def extract_query_tokens(question: str) -> list[str]:
+    """
+    Split the question into lowercase alphanumeric tokens,
+    removing generic stopwords.
+    """
+    tokens = re.findall(r"[a-zA-Z0-9']+", question.lower())
+    return [tok for tok in tokens if tok not in DOMAIN_STOPWORDS]
+
+def chunk_contains_token(meta: dict, tokens: list[str], get_chunk_text) -> bool:
+    """
+    Return True if the chunk's text contains any of the given tokens.
+    """
+    text = get_chunk_text(meta).lower()
+    return any(tok in text for tok in tokens)
 
 def _get_chunk_text(meta: Dict[str, any]) -> str:
     """Lookup the raw text for a chunk given its metadata."""
@@ -78,54 +148,106 @@ def _citations_for(chunks: List[Dict[str, any]]) -> List[Citation]:
 
 @query_router.post("/query", response_model=QueryResponse)
 async def query(payload: QueryPayload) -> QueryResponse:
-    """Answer a question using hybrid search over ingested documents."""
+    """
+    Answer a question using hybrid search over ingested documents and a cross-encoder
+    re-ranker for improved relevance.
+    """
     question = payload.question.strip()
     if not question:
         return QueryResponse(answer="Please provide a question.", citations=[])
-    # Compute embedding for the query
+
+    # Compute embedding for the query (dense vector)
     [qvec] = await embed_texts([question])
-    # Hybrid search
-    results = store.search(qvec, question, top_k=payload.top_k)
+
+    # Use a larger pool for initial hybrid search to give the re-ranker more options.
+    # Here we multiply the requested top_k by 10; adjust as needed.
+    candidate_pool = payload.top_k * 10
+    # Perform the hybrid (dense + lexical) search.
+    results = store.search(qvec, question, top_k=candidate_pool)
+    # Extract meaningful keywords from the query
+    query_keywords = extract_keywords(question)
+    # Filter out candidate chunks that share no keywords with the query
+    filtered = [
+        meta
+        for meta in results
+        if has_keyword_overlap(query_keywords, _get_chunk_text(meta))
+    ]
+
+    if filtered:
+        results = filtered
+
+    # If the re-ranker is loaded, use it to score each candidate chunk.
+    # This step will reorder 'results' so that the most relevant passages
+    # (according to the cross-encoder) appear first.
+    if _RE_RANKER and results:
+        # Build pairs of (question, chunk_text) for the re-ranker
+        pairs = [
+            (question, _get_chunk_text(meta))
+            for meta in results
+        ]
+        # Run the cross-encoder in a background thread to avoid blocking the event loop
+        scores = await asyncio.get_event_loop().run_in_executor(
+            None,
+            _RE_RANKER.predict,
+            pairs
+        )
+        # Pair each meta with its score, then sort descending
+        scored_results = sorted(
+            zip(results, scores),
+            key=lambda x: x[1],
+            reverse=True
+        )
+        # Update results to the re-ranked order
+        results = [meta for meta, _ in scored_results]
+
+    # If no results, fall back to portal link
     if not results:
         fallback = (
-            f"I'm sorry — I don't have enough information in the current documents to answer that. "
-            f"Please refer to the Space Missions Portal for details: {settings.portal_url}"
+            "I'm sorry — I don't have enough information in the current documents to "
+            "answer that. Please refer to the Space Missions Portal for details: "
+            f"{settings.portal_url}"
         )
         return QueryResponse(answer=fallback, citations=[])
-    # Group results by document and select up to ``settings.max_chunks_per_doc`` per document
+
+    # Group results by document and limit the number of chunks per document
     chunks_per_doc: Dict[str, List[Dict[str, any]]] = {}
     doc_order: List[str] = []
     for meta in results:
         d_id = meta["doc_id"]
-        # Record the order in which documents appear
         if d_id not in doc_order:
             doc_order.append(d_id)
-        # Append meta to the list for this document if under the limit
         if d_id not in chunks_per_doc:
             chunks_per_doc[d_id] = []
         if len(chunks_per_doc[d_id]) < settings.max_chunks_per_doc:
             chunks_per_doc[d_id].append(meta)
-    # Limit number of documents considered based on top_k and max_context_docs
-    selected_docs = doc_order[: min(payload.top_k, settings.max_context_docs)]
+
+    # Limit the number of documents based on top_k and max_context_docs
+    selected_docs = doc_order[:min(payload.top_k, settings.max_context_docs)]
+
     # Flatten selected chunks in document order
     selected_chunks: List[Dict[str, any]] = []
     for d_id in selected_docs:
         selected_chunks.extend(chunks_per_doc.get(d_id, []))
+
     # Build context string
     context = _format_context(selected_chunks)
+
     # Compose user prompt for chat model
     user_prompt = (
         f"QUESTION:\n{question}\n\n"
         f"CONTEXT (citations in square brackets):\n{context}\n\n"
-        "Answer with a detailed summary and include the appropriate citation indices inline."
-        "make sure the answer matches the question, for example if the user askes about PTO (Paid Time Off) dont add any information about Telecommunting"
-        "even if it is in the context"
+        "Answer succinctly and include the appropriate citation indices inline."
+        "make sure the answer matches the question"
         "format your answer with PROPER HTML TAGS  us UL, OL, TABLE,P , H and DIV TAGS"
     )
-    # Temperature
+
+    # Determine temperature
     temperature = payload.temperature if payload.temperature is not None else settings.default_temperature
+
     # Generate answer using Ollama chat API
     answer = await chat_complete(SYSTEM_PROMPT, user_prompt, temperature=temperature)
-    # Format citations
+
+    # Build citations list
     citations = _citations_for(selected_chunks)
+
     return QueryResponse(answer=answer, citations=citations)

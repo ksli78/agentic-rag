@@ -133,3 +133,64 @@ async def chat_complete(system_prompt: str, user_prompt: str, temperature: float
             elif "response" in obj:
                 result.append(obj["response"])
     return "".join(result)
+
+
+from typing import Optional, List
+import json
+
+async def extract_category_keywords(document_text: str) -> tuple[Optional[str], Optional[List[str]]]:
+    """
+    Extract a single category and a list of keywords from the provided document text.
+
+    This helper uses the local Ollama chat model via ``chat_complete`` to infer
+    the document's category (e.g. ``policy``, ``procedure``) and up to five
+    concise keywords that describe its content.  The function truncates the
+    input text to the first 4096 characters to avoid hitting context limits.
+    It expects the model to return a JSON string with two keys: ``category``
+    and ``keywords``.  If parsing fails, ``None`` values are returned.
+    """
+    excerpt = document_text[:4096] if document_text else ""
+    if not excerpt:
+        return None, None
+
+    system_prompt = (
+        "You are a classification assistant for internal company documents.\n"
+        "Given a document excerpt, identify one broad category (such as "
+        "'policy', 'procedure', 'form', or 'other') and up to five concise "
+        "keywords that capture its main topics. Respond strictly in JSON with "
+        "two keys: 'category' and 'keywords'.\n"
+        "Example response: {\"category\": \"policy\", "
+        "\"keywords\": [\"paid time off\", \"leave\", \"employees\"]}"
+    )
+    user_prompt = f"Document excerpt:\n{excerpt}\n\nProvide the category and keywords."
+
+    try:
+        # call the existing chat_complete helper; temperature 0 to keep deterministic
+        response = await chat_complete(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            temperature=0.0,
+        )
+    except Exception as ex:
+        log.error(f"Metadata extraction failed: {ex}")
+        return None, None
+
+    try:
+        data = json.loads(response.strip())
+    except json.JSONDecodeError:
+        log.warning(f"Failed to parse JSON from metadata extraction: {response}")
+        return None, None
+
+    category: Optional[str] = None
+    keywords_list: Optional[List[str]] = None
+
+    if isinstance(data, dict):
+        cat = data.get("category")
+        if isinstance(cat, str) and cat.strip():
+            category = cat.strip().lower()
+        kw = data.get("keywords")
+        if isinstance(kw, list) and kw:
+            cleaned = [str(k).strip().lower() for k in kw if str(k).strip()]
+            keywords_list = cleaned if cleaned else None
+
+    return category, keywords_list

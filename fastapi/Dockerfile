@@ -25,6 +25,7 @@ docling-core==2.15.0
 pymupdf==1.23.24
 # Required for UploadFile/Form
 python-multipart==0.0.9
+sentence-transformers==2.6.1
 PIP
 
 RUN pip install --no-cache-dir -r requirements.txt
