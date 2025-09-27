@@ -36,7 +36,10 @@ except Exception as ex:
     _RE_RANKER = None
 
 query_router = APIRouter(tags=["query"])
+# -------- section id helpers --------
 
+_SECTION_LINE = re.compile(r"(?m)^(?:-|\*)?\s*(\d+\.\d+(?:\.\d+)*)\s")
+_HEADING_LINE = re.compile(r"(?m)^\s*#{1,6}\s*(\d+\.\d+(?:\.\d+)*)\b")
 # A minimal set of English stopwords
 COMMON_STOPWORDS = {
     "what", "is", "the", "a", "an", "and", "or", "to", "of", "in", "on",
@@ -80,14 +83,32 @@ SYSTEM_PROMPT = (
     "If the CONTEXT is insufficient, say you don't have the information and provide the portal link given."
     "when referring to the CONTEXT call it the document or the information provided"
 )
+def _section_key(text: str) -> str | None:
+    """
+    Return a section key like '4.3' or '5.4' from a chunk, if present.
+    For bullets '- 5.4.1 ...' returns '5.4'.
+    For headings '## 5.4 Absence Hours ...' returns '5.4'.
+    """
+    m = _HEADING_LINE.search(text)
+    if m:
+        key = m.group(1)
+        return ".".join(key.split(".")[:2])  # major.minor
+
+    m = _SECTION_LINE.search(text)
+    if m:
+        key = m.group(1)
+        return ".".join(key.split(".")[:2])
+
+    return None
 def tokenize(text: str) -> list[str]:
     return re.findall(r"[a-z0-9']+", text.lower())
 
 def extend_chunks(chunks: List[Dict[str, any]], max_extra: int = 2) -> List[Dict[str, any]]:
     """
     Append up to `max_extra` subsequent chunks from the same document
-    for each item in `chunks`. Avoid duplicates. This helps include
-    full bullet lists or paragraph continuations.
+    **only if they share the same major.minor section key** (e.g., 5.4 with 5.4.1).
+    This prevents bleeding into 4.4 Overtime when the question is about 4.3 PTO,
+    but still allows 5.4 bullets to join a 5.4 heading.
     """
     extended: List[Dict[str, any]] = []
     seen: set[str] = set()
@@ -103,21 +124,29 @@ def extend_chunks(chunks: List[Dict[str, any]], max_extra: int = 2) -> List[Dict
             extended.append(meta)
             seen.add(cid)
 
-        # add up to N subsequent chunks from the same doc
+        # Determine this chunk's section family
+        base_key = _section_key(_get_chunk_text(meta))
+
+        # add up to N subsequent chunks from the same doc **with same section key**
         if cid in index_by_id:
             idx = index_by_id[cid]
-            # walk forward
             extras_added = 0
             j = idx + 1
             while j < len(store.chunk_metadata) and extras_added < max_extra:
                 nxt = store.chunk_metadata[j]
                 if nxt["doc_id"] != doc_id:
                     break
-                if nxt["chunk_id"] not in seen:
-                    extended.append(nxt)
-                    seen.add(nxt["chunk_id"])
-                    extras_added += 1
-                j += 1
+                nxt_text = _get_chunk_text(nxt)
+                nxt_key = _section_key(nxt_text)
+                if base_key and nxt_key == base_key:
+                    if nxt["chunk_id"] not in seen:
+                        extended.append(nxt)
+                        seen.add(nxt["chunk_id"])
+                        extras_added += 1
+                        j += 1
+                        continue
+                # stop at first non-matching section family
+                break
 
     return extended
 
@@ -208,7 +237,6 @@ def _build_synonyms_map():
 
 # Call this once when FastAPI starts
 _build_synonyms_map()
-
 @query_router.post("/query", response_model=QueryResponse)
 async def query(payload: QueryPayload) -> QueryResponse:
     """
@@ -244,26 +272,26 @@ async def query(payload: QueryPayload) -> QueryResponse:
     if filtered:
         results = filtered
 
-    # 5) Neighbor inclusion: include next 2 chunks per result to capture continuation
+    # 5) Neighbor inclusion: include next chunks **only within same section family**
     results = extend_chunks(results, max_extra=2)
 
-    # 6) Re-rank via cross-encoder (if available), then keyword-weight the scores
+    # 6) Re-rank via cross-encoder (if available), then soft keyword-weight the scores
     if _RE_RANKER and results:
         pairs = [(question, _get_chunk_text(meta)) for meta in results]
         scores = await asyncio.get_event_loop().run_in_executor(None, _RE_RANKER.predict, pairs)
 
-        # Soft keyword boost (1.5x if keyword present)
+        # Soft keyword boost (1.5x max) to avoid overwhelming CE if a wrong chunk happens to contain a keyword
         keyword_weights = []
         for meta in results:
             text = _get_chunk_text(meta).lower()
-            ratio = 1.0 if any(kw in text for kw in query_keywords) else 0.0
-            keyword_weights.append(1.0 + 0.5 * ratio)  # 1.5x max
+            has_kw = any(kw in text for kw in query_keywords)
+            keyword_weights.append(1.5 if has_kw else 1.0)
 
         weighted_scores = [s * w for s, w in zip(scores, keyword_weights)]
         order = sorted(zip(results, weighted_scores), key=lambda x: x[1], reverse=True)
         results = [meta for meta, _ in order]
 
-    # 7) If nothing left after filters/ranking, return fallback
+    # 7) Fallback if nothing left
     if not results:
         fallback = (
             "I'm sorry — I don't have enough information in the current documents to "
@@ -298,9 +326,12 @@ async def query(payload: QueryPayload) -> QueryResponse:
     user_prompt = (
         f"QUESTION:\n{question}\n\n"
         f"CONTEXT (citations in square brackets):\n{context}\n\n"
-        "Answer succinctly and include the appropriate citation indices inline. "
+        "Answer with a succinct summary and include the appropriate citation indices inline. "
         "Make sure the answer matches the question. "
-        "Format your answer with PROPER HTML TAGS (UL, OL, TABLE, P, H, DIV)."
+        "Format your answer with PROPER HTML TAGS (UL, OL, TABLE, P, H, DIV). "
+        "Make sure to not repeat your self in the response. Make sure to leave out repeating information "
+        "When refering to the CONTEXT always use a friendlier name like 'Information Provided' or 'data available' when NOT in Citation "
+        "Never use the word 'CONTEXT' when referring to the 'CONTEXT' in your response"
     )
 
     temperature = payload.temperature if payload.temperature is not None else settings.default_temperature

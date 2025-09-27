@@ -20,7 +20,7 @@ import numpy as np
 
 # Import settings from the top-level config module to avoid relative import issues
 from config import settings
-
+from typing import List
 
 log = logging.getLogger("api.utils")
 
@@ -86,6 +86,7 @@ def split_markdown_blocks(md: str, block_size: int) -> List[str]:
       - A heading and its immediate list items stay together
       - A short intro paragraph immediately following a heading is attached
       - Long blocks are split at newline boundaries up to `block_size`
+      - IMPORTANT: numbered items like '- 4.1 ... - 4.2 ...' are split into separate chunks
     """
     import re
 
@@ -98,18 +99,44 @@ def split_markdown_blocks(md: str, block_size: int) -> List[str]:
     MAX_INTRO_LINES = 2  # how many non-list lines after a heading to keep with it
 
     def flush_heading():
-        """Append accumulated heading + list + (optional short intro) as one paragraph."""
+        """Append accumulated heading + list + (optional short intro) as one or more paragraph(s)."""
         nonlocal heading_accum
         if heading_accum:
-            paras.append("\n".join(heading_accum).strip())
+            text = "\n".join(heading_accum).strip()
+            # If a combined heading/list contains multiple numbered items like "- 4.1 ... - 4.2 ...",
+            # split them into separate paragraphs to prevent mixing definitions (e.g., 4.3 PTO vs 4.4 Overtime).
+            split_numbered_into_paras(text, paras)
             heading_accum = []
 
     def flush_current():
-        """Append accumulated normal lines as one paragraph."""
+        """Append accumulated normal lines as one or more paragraph(s)."""
         nonlocal current
         if current:
-            paras.append("\n".join(current).strip())
+            text = "\n".join(current).strip()
+            split_numbered_into_paras(text, paras)
             current = []
+
+    def split_numbered_into_paras(text: str, out: List[str]):
+        """
+        If a block contains multiple top-level numbered items like:
+          - 4.1 ...
+          - 4.2 ...
+        split into individual paragraphs so 4.3 and 4.4 don't share one chunk.
+        Otherwise, append as-is.
+        """
+        # Detect occurrences of top-level numbered items at line starts (markdown bullet or plain)
+        numbered_line = re.compile(r"(?m)^(?:-|\*)?\s*(\d+\.\d+(?:\.\d+)*)\s")
+        matches = list(numbered_line.finditer(text))
+        if len(matches) <= 1:
+            out.append(text)
+            return
+
+        # Split at each numbered item while keeping the item line with its paragraph
+        starts = [m.start() for m in matches] + [len(text)]
+        for i in range(len(starts) - 1):
+            piece = text[starts[i]:starts[i+1]].strip()
+            if piece:
+                out.append(piece)
 
     # pass 1: build structural paragraphs
     i = 0
@@ -206,11 +233,12 @@ def split_markdown_blocks(md: str, block_size: int) -> List[str]:
             # prefer to cut at a newline boundary if one exists in the window
             nl = p.rfind("\n", start, end)
             cut = nl if (nl is not None and nl > start + 100) else end
-            chunks.append(p[start:cut].strip())
+            piece = p[start:cut].strip()
+            if piece:
+                chunks.append(piece)
             start = cut
 
     return chunks
-
 
 
 async def chat_complete(system_prompt: str, user_prompt: str, temperature: float) -> str:
