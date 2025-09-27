@@ -32,7 +32,7 @@ from __future__ import annotations
 import json
 import os
 from typing import Any, Dict, List
-
+from config import settings
 import numpy as np
 
 try:
@@ -166,56 +166,69 @@ class IndexStore:
     # ------------------------------------------------------------------
     # Search
     #
+
+
     def search(self, query_vector: List[float], query_text: str, top_k: int = 3) -> List[Dict[str, Any]]:
         """
         Retrieve the top K chunks relevant to the query using hybrid search.
 
         A dense search is performed using the FAISS index (cosine similarity).
-        A lexical search is performed using the TF‑IDF model.  Scores are
-        normalised and blended according to ``self.alpha``.
+        A lexical search is performed using the TF-IDF model. Scores are
+        normalized and blended according to self.alpha.
 
         Returns a list of chunk metadata dicts ordered by combined score.
         """
         if self.faiss_index is None or not self.chunk_metadata:
             return []
+
         # Dense search across all vectors
         q = np.array([query_vector], dtype="float32")
         faiss.normalize_L2(q)
-        # Retrieve all scores (FAISS returns all by default if k >= total)
         dists, idxs = self.faiss_index.search(q, len(self.chunk_metadata))
         dense_scores = dists[0]
+
         # Lexical search
         if self.tfidf_vectorizer is None or self.tfidf_matrix is None:
             lexical_scores = np.zeros(len(self.chunk_metadata), dtype="float32")
         else:
             q_vec = self.tfidf_vectorizer.transform([query_text])
-            # Dot product between query TF‑IDF and corpus TF‑IDF
             lexical_scores = (q_vec @ self.tfidf_matrix.T).toarray().flatten()
-        # Normalise dense scores to [0,1]
+
+        # Normalize dense scores to [0,1]
         if dense_scores.size > 0:
-            d_max = float(dense_scores.max())
-            d_min = float(dense_scores.min())
-            if d_max > d_min:
-                dense_norm = (dense_scores - d_min) / (d_max - d_min)
-            else:
-                dense_norm = np.zeros_like(dense_scores)
+            d_max, d_min = float(dense_scores.max()), float(dense_scores.min())
+            dense_norm = (dense_scores - d_min) / (d_max - d_min) if d_max > d_min else np.zeros_like(dense_scores)
         else:
             dense_norm = np.zeros(len(self.chunk_metadata), dtype="float32")
-        # Normalise lexical scores to [0,1]
+
+        # Normalize lexical scores to [0,1]
         if lexical_scores.size > 0:
-            l_max = float(lexical_scores.max())
-            l_min = float(lexical_scores.min())
-            if l_max > l_min:
-                lexical_norm = (lexical_scores - l_min) / (l_max - l_min)
-            else:
-                lexical_norm = np.zeros_like(lexical_scores)
+            l_max, l_min = float(lexical_scores.max()), float(lexical_scores.min())
+            lexical_norm = (lexical_scores - l_min) / (l_max - l_min) if l_max > l_min else np.zeros_like(lexical_scores)
         else:
             lexical_norm = np.zeros(len(self.chunk_metadata), dtype="float32")
-        # Combine scores; align indices
+
+        # Combine & threshold
         combined_scores = self.alpha * dense_norm + (1.0 - self.alpha) * lexical_norm
-        # Rank by combined score
-        top_indices = np.argsort(-combined_scores)[: max(top_k, 0)]
+
+        # Apply min similarity threshold (drop weak matches)
+        mask = combined_scores >= float(getattr(settings, "min_sim_threshold", 0.30))
+        if mask.sum() == 0:
+            # if everything is below threshold, fall back to top_k with combined order
+            top_indices = np.argsort(-combined_scores)[: max(top_k, 0)]
+            return [self.chunk_metadata[i] for i in top_indices]
+
+        filtered_indices = np.where(mask)[0]
+        filtered_scores = combined_scores[mask]
+
+        # Rank filtered by combined score
+        order = np.argsort(-filtered_scores)
+        filtered_sorted = filtered_indices[order]
+
+        # Cap to top_k
+        top_indices = filtered_sorted[: max(top_k, 0)]
         return [self.chunk_metadata[i] for i in top_indices]
+
 
     # ------------------------------------------------------------------
     # Metadata helpers

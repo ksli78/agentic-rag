@@ -79,62 +79,137 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     denom = (np.linalg.norm(a) * np.linalg.norm(b)) or 1e-9
     return float(np.dot(a, b) / denom)
 
+
 def split_markdown_blocks(md: str, block_size: int) -> List[str]:
+    """
+    Split Markdown into logical blocks that preserve structure:
+      - A heading and its immediate list items stay together
+      - A short intro paragraph immediately following a heading is attached
+      - Long blocks are split at newline boundaries up to `block_size`
+    """
     import re
+
     lines = md.splitlines()
-    paras = []
-    current = []
-    heading_accum = []  # holds a heading and its list items
+    paras: List[str] = []
+    current: List[str] = []
+    heading_accum: List[str] = []  # holds a heading and its list items (+ optional short intro)
+
+    # tweakable heuristics
+    MAX_INTRO_LINES = 2  # how many non-list lines after a heading to keep with it
 
     def flush_heading():
-        # Append accumulated heading+list as one paragraph
+        """Append accumulated heading + list + (optional short intro) as one paragraph."""
         nonlocal heading_accum
         if heading_accum:
             paras.append("\n".join(heading_accum).strip())
             heading_accum = []
 
-    for line in lines:
+    def flush_current():
+        """Append accumulated normal lines as one paragraph."""
+        nonlocal current
+        if current:
+            paras.append("\n".join(current).strip())
+            current = []
+
+    # pass 1: build structural paragraphs
+    i = 0
+    while i < len(lines):
+        line = lines[i]
         stripped = line.strip()
+
         is_heading = stripped.startswith("#")
-        is_list = (stripped.startswith("-") or stripped.startswith("*")
-                   or re.match(r"^\d+[.)]", stripped) is not None)
+        is_list = (
+            stripped.startswith("-") or
+            stripped.startswith("*") or
+            re.match(r"^\d+[.)]\s+", stripped) is not None
+        )
 
         if is_heading:
+            # finish any previous paragraph
             flush_heading()
-            # headings start a new accumulated block
+            flush_current()
+
+            # start a new heading block
             heading_accum = [line]
+
+            # attach immediate list items
+            j = i + 1
+            while j < len(lines):
+                nxt = lines[j].strip()
+                if nxt == "":
+                    break
+                if (
+                    nxt.startswith("-") or nxt.startswith("*") or
+                    re.match(r"^\d+[.)]\s+", nxt) is not None
+                ):
+                    heading_accum.append(lines[j])
+                    j += 1
+                else:
+                    break
+
+            # optionally attach a short “intro” paragraph if it immediately follows the heading and no list items were found
+            if j == i + 1:  # no list items; look ahead for 1–2 short lines
+                intro_count = 0
+                k = j
+                while k < len(lines) and intro_count < MAX_INTRO_LINES:
+                    nxt = lines[k].strip()
+                    if nxt == "":
+                        break
+                    # stop if next is a new heading or list
+                    if nxt.startswith("#") or nxt.startswith("-") or nxt.startswith("*") or re.match(r"^\d+[.)]\s+", nxt):
+                        break
+                    heading_accum.append(lines[k])
+                    intro_count += 1
+                    k += 1
+                j = k
+
+            # advance
+            i = j
+            continue
+
         elif heading_accum and is_list:
-            # attach list items to the current heading
+            # list following a heading—keep accumulating
             heading_accum.append(line)
+            i += 1
+            continue
+
         elif stripped == "":
+            # blank line ends whichever block is open
             flush_heading()
-            if current:
-                paras.append("\n".join(current).strip())
-                current = []
+            flush_current()
+            i += 1
+            continue
+
         else:
-            flush_heading()
+            # normal text line (not a heading, not a list)
+            if heading_accum:
+                # If we ended up here we already attached an intro; start a new block
+                flush_heading()
             current.append(line)
+            i += 1
 
+    # flush remaining
     flush_heading()
-    if current:
-        paras.append("\n".join(current).strip())
+    flush_current()
 
-    # Now split long paragraphs by block_size
-    chunks = []
+    # pass 2: split any too-long paragraphs by block_size, cutting at newlines where possible
+    chunks: List[str] = []
     for p in paras:
         if len(p) <= block_size:
             chunks.append(p)
-        else:
-            start = 0
-            while start < len(p):
-                end = min(start + block_size, len(p))
-                # cut at a newline if possible
-                nl = p.rfind("\n", start, end)
-                cut = nl if nl > start + 100 else end
-                chunks.append(p[start:cut].strip())
-                start = cut
-    return chunks
+            continue
 
+        start = 0
+        L = len(p)
+        while start < L:
+            end = min(start + block_size, L)
+            # prefer to cut at a newline boundary if one exists in the window
+            nl = p.rfind("\n", start, end)
+            cut = nl if (nl is not None and nl > start + 100) else end
+            chunks.append(p[start:cut].strip())
+            start = cut
+
+    return chunks
 
 
 
