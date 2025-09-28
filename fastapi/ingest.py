@@ -33,6 +33,45 @@ try:
     from docling.document_converter import DocumentConverter  # type: ignore
 except Exception:
     DocumentConverter = None
+def split_md_and_tag_pages(md_text: str, page_count: int, block_size: int) -> tuple[list[str], list[int]]:
+    """
+    Split Markdown text into chunks and return two lists: chunks and page numbers.
+    Uses the existing split_markdown_blocks() helper to break each page’s text.
+    The page number for each chunk is set based on the '## Page N' markers.
+    """
+    from utils import split_markdown_blocks
+
+    lines = md_text.splitlines()
+    current_page = 1
+    buffer: list[str] = []
+    chunks: list[str] = []
+    pages: list[int] = []
+    for ln in lines:
+        # detect page markers inserted by Docling or PyMuPDF
+        if ln.strip().startswith("## Page"):
+            # flush previous buffer
+            if buffer:
+                joined = "\n".join(buffer).strip()
+                # use your existing split_markdown_blocks to break into sub-chunks
+                for sub in split_markdown_blocks(joined, block_size):
+                    chunks.append(sub)
+                    pages.append(current_page)
+                buffer.clear()
+            # set current page
+            parts = ln.split()
+             # handle both "## Page" and "## Page X"
+            if len(parts) >= 3 and parts[2].isdigit():
+                current_page = int(parts[2])
+            continue
+        buffer.append(ln)
+    # flush remainder
+    if buffer:
+        joined = "\n".join(buffer).strip()
+        for sub in split_markdown_blocks(joined, block_size):
+            chunks.append(sub)
+            pages.append(current_page)
+
+    return chunks, pages
 
 
 def extract_pdf_to_markdown(tmp_path: str) -> tuple[str, int]:
@@ -105,7 +144,7 @@ async def ingest_upload(
     lines = [ln for ln in md_text.splitlines() if not any(bp in ln.upper() for bp in ban_phrases)]
     md_text = "\n".join(lines).strip()
     # Split into blocks
-    raw_chunks = [c for c in split_markdown_blocks(md_text, settings.chunk_size) if c and len(c.strip()) >= MIN_CHARS]
+    raw_chunks, page_numbers = split_md_and_tag_pages(md_text, num_pages, settings.chunk_size)
     log.info(f"Chunked into {len(raw_chunks)} blocks (>= {MIN_CHARS} chars).")
     if not raw_chunks:
         log.warning("No usable text/chunks produced from PDF. Skipping ingestion.")
@@ -143,14 +182,14 @@ async def ingest_upload(
 
     # Build chunk metadata
     chunk_meta: List[dict] = []
-    for _ in range(len(raw_chunks)):
+    for idx in range(len(raw_chunks)):
         meta = {
             "chunk_id": str(uuid.uuid4()),
             "doc_id": final_doc_id,
             "title": doc_meta["title"],
             "source_url": doc_meta["source_url"],
-            "page_start": 1,
-            "page_end": num_pages,
+            "page_start": page_numbers[idx],  # real page number
+            "page_end": page_numbers[idx],    # single page per chunk
         }
         chunk_meta.append(meta)
     # Store in index

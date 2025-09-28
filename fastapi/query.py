@@ -204,24 +204,34 @@ def _format_context(chunks: List[Dict[str, any]]) -> str:
 
 
 def _citations_for(chunks: List[Dict[str, any]]) -> List[Citation]:
-    """
-    Build citations with human-friendly titles. Titles are taken from document metadata.
-    """
-    doc_ids = list({ch["doc_id"] for ch in chunks})
-    meta_lookup = store.get_document_metadata(doc_ids)
-    citations: List[Citation] = []
+    seen = set()
+    citations = []
+    meta_lookup = store.get_document_metadata(list({ch["doc_id"] for ch in chunks}))
     for ch in chunks:
-        d = meta_lookup.get(ch["doc_id"], {})
+        title = meta_lookup.get(ch["doc_id"], {}).get("title") or ch.get("title")
+        p_start = int(ch.get("page_start", 1))
+        p_end = int(ch.get("page_end", 1))
+        key = (title, p_start, p_end)
+        if key in seen:
+            continue
+        seen.add(key)
         citations.append(
             Citation(
                 doc_id=ch["doc_id"],
-                title=d.get("title") or ch.get("title"),
-                source_url=d.get("source_url"),
-                page_start=int(ch.get("page_start", 1)),
-                page_end=int(ch.get("page_end", 1)),
+                title=title,
+                source_url=meta_lookup.get(ch["doc_id"], {}).get("source_url"),
+                page_start=p_start,
+                page_end=p_end,
             )
         )
     return citations
+
+def heading_similarity(query_keywords: list[str], heading: str) -> float:
+    head_kw = set(extract_keywords(heading))
+    if not head_kw:
+        return 0.0
+    overlap = head_kw.intersection(set(query_keywords))
+    return len(overlap) / len(head_kw)
 
 def _build_synonyms_map():
     global SYNONYMS_MAP
