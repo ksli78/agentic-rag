@@ -327,10 +327,8 @@ async def query(payload: QueryPayload) -> QueryResponse:
         f"QUESTION:\n{question}\n\n"
         f"CONTEXT (citations in square brackets):\n{context}\n\n"
         "Answer with a succinct summary and include the appropriate citation indices inline. "
-        "Make sure the answer matches the question. "
         "Format your answer with PROPER HTML TAGS (UL, OL, TABLE, P, H, DIV). "
         "Make sure to not repeat your self in the response. Make sure to leave out repeating information "
-        "When refering to the CONTEXT always use a friendlier name like 'Information Provided' or 'data available' when NOT in Citation "
         "Never use the word 'CONTEXT' when referring to the 'CONTEXT' in your response"
     )
 
